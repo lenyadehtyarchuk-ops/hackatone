@@ -17,6 +17,8 @@ struct CorrelationResult {
     double ground_speed_mps;   // путевая скорость = step_m / dt_s
     int    profile_len;        // длина использованного профиля
     cv::Mat corr_map;          // float32, 360 строк × max_offset_px столбцов
+    bool   low_confidence;     // true если NCC < порога или рельеф слишком плоский
+    double profile_std;        // σ измеренного профиля (информативность рельефа)
 };
 
 struct CorrelatorConfig {
@@ -51,10 +53,11 @@ private:
                                        double azimuth_deg, int n_points,
                                        double step_px_x, double step_px_y) const;
 
-    // Нормированная кросс-корреляция двух профилей (sliding window)
-    // Возвращает вектор NCC[offset] для всех смещений
-    static std::vector<float> ncc_sliding(const std::vector<double>& measured,
-                                          const std::vector<float>& reference);
+    // Взвешенная нормированная кросс-корреляция (веса по отклонению M от среднего)
+    static std::vector<float> ncc_sliding_weighted(
+        const std::vector<double>& measured,
+        const std::vector<float>&  reference,
+        const std::vector<double>& weights);
 
     const DemData* m_dem;
     CorrelatorConfig m_cfg;

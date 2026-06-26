@@ -161,6 +161,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Низкая уверенность → не обновлять Калман, держать мёртвое счисление
+        if (res->low_confidence) {
+            accept = false;
+            std::cerr << "[MAIN] Низкая уверенность: NCC=" << res->best_ncc
+                      << " σ_рельефа=" << res->profile_std
+                      << " м — мёртвое счисление\n";
+        }
+
         // Оценка точности по NCC: чем выше NCC, тем меньше шум измерения
         double noise_m = 200.0 * (1.0 - std::max(0.0, res->best_ncc));
         if (accept) kf.correct(x_m, y_m, noise_m);
