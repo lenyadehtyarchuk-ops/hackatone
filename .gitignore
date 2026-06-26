@@ -1,0 +1,11 @@
+build/
+data/dem/
+data/nmea/steppe_flight.nmea
+__pycache__/
+*.pyc
+*.o
+*.a
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
