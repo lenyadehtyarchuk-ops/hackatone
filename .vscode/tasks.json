@@ -2,6 +2,15 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "install deps (GDAL)",
+            "type": "shell",
+            "command": "sudo apt-get update && sudo apt-get install -y libgdal-dev",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "cmake configure",
             "type": "shell",
             "command": "cmake",

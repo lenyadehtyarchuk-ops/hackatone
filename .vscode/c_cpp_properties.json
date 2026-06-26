@@ -4,30 +4,15 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/third_party/onnxruntime/include",
-                "/usr/include/opencv4",
-                "${workspaceFolder}/third_party/imgui",
-                "${workspaceFolder}/third_party/imgui/backends"
+                "${workspaceFolder}/third_party/gdal-dev/usr/include/gdal",
+                "/usr/include/gdal",
+                "/usr/local/include"
             ],
             "defines": [],
             "compilerPath": "/usr/bin/g++",
             "cStandard": "c17",
             "cppStandard": "c++17",
             "intelliSenseMode": "linux-gcc-x64"
-        },
-        {
-            "name": "Win32",
-            "includePath": [
-                "${workspaceFolder}/**",
-                "${workspaceFolder}/third_party/onnxruntime/include",
-                "${workspaceFolder}/third_party/imgui",
-                "${workspaceFolder}/third_party/imgui/backends"
-            ],
-            "defines": ["_WIN32"],
-            "compilerPath": "cl.exe",
-            "cStandard": "c17",
-            "cppStandard": "c++17",
-            "intelliSenseMode": "windows-msvc-x64"
         }
     ],
     "version": 4

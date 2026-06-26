@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/yasogaru/hackatone/hackatone/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

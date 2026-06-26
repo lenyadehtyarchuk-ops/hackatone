@@ -1,0 +1,3 @@
+/home/yasogaru/hackatone/hackatone/build/CMakeFiles/gdal_test.dir
+/home/yasogaru/hackatone/hackatone/build/CMakeFiles/edit_cache.dir
+/home/yasogaru/hackatone/hackatone/build/CMakeFiles/rebuild_cache.dir

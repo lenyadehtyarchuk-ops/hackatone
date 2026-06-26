@@ -1,0 +1,17 @@
+CONFIG_VERSION=3.12.2
+CONFIG_INST_PREFIX=/usr
+CONFIG_INST_LIBS=-L/usr/lib/x86_64-linux-gnu -lgdal
+CONFIG_INST_CFLAGS=-I/usr/include/gdal
+CONFIG_INST_DATA=/usr/share/gdal
+prefix=${CONFIG_INST_PREFIX}
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib/x86_64-linux-gnu
+includedir=${exec_prefix}/include/gdal
+datadir=${CONFIG_INST_DATA}
+
+Name: libgdal
+Description: Geospatial Data Abstraction Library
+Version: ${CONFIG_VERSION}
+Libs: ${CONFIG_INST_LIBS}
+Libs.private: -larchive -lodbcinst -lssl -llzma -llz4 -larmadillo -lqhull_r -lmuparser -ldeflate -lgeotiff -ltiff -lavif -lheif -lzstd -laec -ljpeg -lpoppler -lpng -lgif -lnetcdf -lblosc -lcfitsio -L/usr/lib/x86_64-linux-gnu/hdf5/serial -lhdf5 -lcrypto -lpthread -lsz -ldl -lwebp -ldf -lmfhdf -lopenjp2 -ljxl -ljxl_threads -lkmlbase -lkmldom -lkmlengine -lminizip -luriparser -lfyba -lfygm -lfyut -lpcre2-8 -lspatialite -lsqlite3 -lxerces-c -lmysqlclient -lpq -lodbc -lfreexl -lexpat -lxml2 -lgeos_c -lcurl -lproj -ljson-c -lz -lstdc++ -lm
+Cflags: ${CONFIG_INST_CFLAGS}
