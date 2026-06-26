@@ -109,13 +109,39 @@ def main():
     parser.add_argument("--out",  default="results/trajectory_satellite.png")
     parser.add_argument("--zoom", type=int, default=12, help="Zoom тайлов (10-14)")
     parser.add_argument("--cache", default="/tmp/sat_tiles", help="Папка кэша тайлов")
+    parser.add_argument("--jammer-zone", default="", help="Зона глушения: lat1,lon1,lat2,lon2")
+    parser.add_argument("--trn", default="", help="CSV с TRN-оценками (found_lat,found_lon из stdout trn)")
     args = parser.parse_args()
 
     os.makedirs(args.cache, exist_ok=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
-    lat_min, lat_max, lon_min, lon_max = get_dem_bbox(args.dem)
-    print(f"Bbox ЦМР: lat=[{lat_min:.4f},{lat_max:.4f}] lon=[{lon_min:.4f},{lon_max:.4f}]",
+    # Читаем GT один раз: для bbox и для рисования
+    gt_rows = []  # список (lat, lon, gps_ok)
+    with open(args.gt, newline="") as f:
+        for row in csv.DictReader(f):
+            gt_rows.append((float(row["lat"]), float(row["lon"]),
+                            int(row.get("gps_ok", 1))))
+
+    if not gt_rows:
+        raise RuntimeError("GT CSV пустой")
+
+    gt_lats = [r[0] for r in gt_rows]
+    gt_lons = [r[1] for r in gt_rows]
+
+    if not gt_lats:
+        raise RuntimeError("GT CSV пустой")
+
+    MARGIN_KM = 4.0  # +30% к прежнему 3 км
+    lat_margin = MARGIN_KM / 111.32
+    cos_lat = math.cos(math.radians(sum(gt_lats) / len(gt_lats)))
+    lon_margin = MARGIN_KM / (111.32 * cos_lat)
+
+    lat_min = min(gt_lats) - lat_margin
+    lat_max = max(gt_lats) + lat_margin
+    lon_min = min(gt_lons) - lon_margin
+    lon_max = max(gt_lons) + lon_margin
+    print(f"Bbox маршрута+margin: lat=[{lat_min:.4f},{lat_max:.4f}] lon=[{lon_min:.4f},{lon_max:.4f}]",
           file=sys.stderr)
 
     # Тайловые индексы для bbox
@@ -146,41 +172,99 @@ def main():
 
     print(f"Скачано {downloaded}/{total} тайлов", file=sys.stderr)
 
-    # Читаем ground-truth CSV и рисуем маршрут
+    # --- Зона глушения GPS (полупрозрачный красный прямоугольник) ---
+    if args.jammer_zone:
+        j = [float(x) for x in args.jammer_zone.split(",")]
+        jx1, jy1 = latlon_to_pixel(j[0], j[1], args.zoom, x_min_t, y_min_t, TILE)
+        jx2, jy2 = latlon_to_pixel(j[2], j[3], args.zoom, x_min_t, y_min_t, TILE)
+        rx1, ry1 = min(jx1, jx2), min(jy1, jy2)
+        rx2, ry2 = max(jx1, jx2), max(jy1, jy2)
+        overlay = Image.new("RGBA", mosaic.size, (0, 0, 0, 0))
+        draw_ov = ImageDraw.Draw(overlay)
+        draw_ov.rectangle([rx1, ry1, rx2, ry2], fill=(255, 30, 30, 55))     # ~22% красный
+        draw_ov.rectangle([rx1, ry1, rx2, ry2], outline=(255, 60, 60, 220), width=2)
+        mosaic = Image.alpha_composite(mosaic.convert("RGBA"), overlay).convert("RGB")
+        draw_txt = ImageDraw.Draw(mosaic)
+        draw_txt.text((rx1 + 5, ry1 + 5), "GPS DENIED", fill=(255, 200, 200))
+
+    # Строим пиксели из уже прочитанных GT-точек
     draw = ImageDraw.Draw(mosaic)
     pts = []
     gps_flags = []
-
-    with open(args.gt, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            lat, lon = float(row["lat"]), float(row["lon"])
-            gps_ok = int(row.get("gps_ok", 1))
-            px, py = latlon_to_pixel(lat, lon, args.zoom, x_min_t, y_min_t, TILE)
-            pts.append((px, py))
-            gps_flags.append(gps_ok)
+    for lat, lon, gps_ok in gt_rows:
+        px, py = latlon_to_pixel(lat, lon, args.zoom, x_min_t, y_min_t, TILE)
+        pts.append((px, py))
+        gps_flags.append(gps_ok)
 
     if len(pts) >= 2:
         for i in range(1, len(pts)):
-            color = (255, 50, 50) if gps_flags[i] else (255, 220, 0)
+            color = (255, 220, 0) if gps_flags[i] else (255, 50, 50)  # жёлтый вне зоны, красный внутри
             # Белая обводка
             draw.line([pts[i-1], pts[i]], fill=(255,255,255), width=5)
             draw.line([pts[i-1], pts[i]], fill=color, width=3)
+
+    # Попытка загрузить шрифт побольше
+    try:
+        from PIL import ImageFont
+        try:
+            font_label = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+        except Exception:
+            font_label = ImageFont.load_default()
+            font_small = font_label
+    except Exception:
+        font_label = None
+        font_small = None
+
+    def draw_label(d, x, y, text, color, shadow=(0,0,0)):
+        kw = {"font": font_label} if font_label else {}
+        d.text((x+1, y+1), text, fill=shadow, **kw)
+        d.text((x, y), text, fill=color, **kw)
 
     if pts:
         # Старт — зелёный
         sx, sy = pts[0]
         draw.ellipse([sx-10, sy-10, sx+10, sy+10], fill=(255,255,255))
         draw.ellipse([sx-8,  sy-8,  sx+8,  sy+8 ], fill=(30, 210, 30))
-        # Финиш — синий квадрат
+        draw_label(draw, sx + 14, sy - 10, "Start", (120, 255, 120))
+        # Финиш — оранжевый квадрат
         ex, ey = pts[-1]
         draw.rectangle([ex-10, ey-10, ex+10, ey+10], fill=(255,255,255))
-        draw.rectangle([ex-8,  ey-8,  ex+8,  ey+8 ], fill=(30, 80, 220))
+        draw.rectangle([ex-8,  ey-8,  ex+8,  ey+8 ], fill=(220, 80, 30))
+        draw_label(draw, ex + 14, ey - 10, "End", (255, 180, 80))
 
-    # Подписи
+    # --- TRN estimated track ---
+    if args.trn and os.path.exists(args.trn):
+        trn_rows = []
+        with open(args.trn, newline="") as f:
+            for row in csv.DictReader(f):
+                trn_rows.append((float(row["found_lat"]), float(row["found_lon"])))
+        if trn_rows:
+            # Линия от старта GT до первого TRN фикса (период накопления)
+            start_px = latlon_to_pixel(gt_rows[0][0], gt_rows[0][1], args.zoom, x_min_t, y_min_t, TILE)
+            first_trn_px = latlon_to_pixel(trn_rows[0][0], trn_rows[0][1], args.zoom, x_min_t, y_min_t, TILE)
+            draw.line([start_px, first_trn_px], fill=(80, 80, 255), width=5)
+            draw.line([start_px, first_trn_px], fill=(120, 180, 255), width=3)
+            # Соединяем TRN фиксы
+            trn_pts = [first_trn_px] + [
+                latlon_to_pixel(lat, lon, args.zoom, x_min_t, y_min_t, TILE)
+                for lat, lon in trn_rows[1:]
+            ]
+            for i in range(1, len(trn_pts)):
+                draw.line([trn_pts[i-1], trn_pts[i]], fill=(80, 80, 255), width=5)
+                draw.line([trn_pts[i-1], trn_pts[i]], fill=(120, 180, 255), width=3)
+            # Финиш TRN
+            ex, ey = trn_pts[-1]
+            draw.rectangle([ex-8, ey-8, ex+8, ey+8], fill=(255,255,255))
+            draw.rectangle([ex-6, ey-6, ex+6, ey+6], fill=(60, 120, 255))
+            draw_label(draw, ex + 12, ey - 10, "TRN end", (120, 180, 255))
+
+    # Легенда
     try:
-        draw.text((10, 10), "GPS TRACK (ground truth)", fill=(255,255,255))
-        draw.text((10, 28), f"Red=GPS ok  Yellow=GPS denied  zoom={args.zoom}", fill=(200,200,200))
+        kw_s = {"font": font_small} if font_small else {}
+        draw.text((10, 10), "GPS TRACK (ground truth)", fill=(255,255,255), **kw_s)
+        draw.text((10, 30), f"Yellow = GPS ok   Red = GPS denied   zoom={args.zoom}", fill=(200,200,200), **kw_s)
+        draw.text((10, 50), "Blue = TRN estimated track", fill=(120, 180, 255), **kw_s)
     except Exception:
         pass
 

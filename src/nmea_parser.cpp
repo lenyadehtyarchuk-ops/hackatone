@@ -66,10 +66,22 @@ std::optional<NmeaFix> NmeaParser::parse_gpgga(const std::string& raw_line) {
 
     NmeaFix fix{};
     try {
-        fix.timestamp_s  = fields[1].empty() ? 0.0 : parse_hhmmss(fields[1]);
-        fix.gps_quality  = fields[6].empty() ? 1   : std::stoi(fields[6]);
-        fix.radio_alt_m  = fields[9].empty() ? 0.0 : std::stod(fields[9]);
-        fix.baro_alt_m   = fields[11].empty() ? 0.0 : std::stod(fields[11]);
+        fix.timestamp_s = fields[1].empty() ? 0.0 : parse_hhmmss(fields[1]);
+        fix.gps_quality = fields[6].empty() ? 1   : std::stoi(fields[6]);
+        fix.radio_alt_m = fields[9].empty() ? 0.0 : std::stod(fields[9]);
+        fix.baro_alt_m  = fields[11].empty() ? 0.0 : std::stod(fields[11]);
+        // Координаты присутствуют только когда GPS работает (quality > 0)
+        fix.lat = 0.0; fix.lon = 0.0;
+        if (fix.gps_quality > 0 && !fields[2].empty() && !fields[4].empty()) {
+            // NMEA: DDMM.MMMMM → градусы
+            auto nmea2deg = [](const std::string& s) {
+                double raw = std::stod(s);
+                int deg = static_cast<int>(raw / 100);
+                return deg + (raw - deg * 100.0) / 60.0;
+            };
+            fix.lat = nmea2deg(fields[2]) * (fields[3] == "S" ? -1 : 1);
+            fix.lon = nmea2deg(fields[4]) * (fields[5] == "W" ? -1 : 1);
+        }
     } catch (...) {
         return std::nullopt;
     }

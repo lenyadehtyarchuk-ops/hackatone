@@ -9,6 +9,8 @@ struct NmeaFix {
     double radio_alt_m;   // высота над рельефом (AGL), м
     double baro_alt_m;    // барометрическая высота (MSL), м
     int    gps_quality;   // поле 6 GPGGA: 0=нет GPS (зона глушения), 1=GPS, 2=DGPS
+    double lat;           // широта (только если gps_quality > 0)
+    double lon;           // долгота (только если gps_quality > 0)
 };
 
 class NmeaParser {

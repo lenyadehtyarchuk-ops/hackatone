@@ -160,11 +160,34 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                        static_cast<int>(std::round(py))});
     }
 
-    // Линия маршрута: белая обводка + красная (TRN) / жёлтая (GPS-denied участок)
+    // Пиксель старта (нужен раньше для линии накопления)
+    auto [sx, sy] = DemLoader::geo_to_pixel(dem.gt, start_lat, start_lon);
+    cv::Point sp{static_cast<int>(std::round(sx)), static_cast<int>(std::round(sy))};
+
+    // Линия от старта до первой TRN-точки (период накопления профиля, ~40 шагов)
+    if (!pts.empty()) {
+        cv::line(vis, sp, pts[0], cv::Scalar(255, 255, 255), 5, cv::LINE_AA);
+        cv::line(vis, sp, pts[0], cv::Scalar(0, 220, 255), 3, cv::LINE_AA);  // жёлтый = вне зоны
+    }
+
+    // Предвычислить bbox зоны глушения (в координатах) для точного окрашивания
+    double jlat_min = 0, jlat_max = 0, jlon_min = 0, jlon_max = 0;
+    bool has_jammer = (jammer_zone.size() == 4);
+    if (has_jammer) {
+        jlat_min = std::min(jammer_zone[0], jammer_zone[2]);
+        jlat_max = std::max(jammer_zone[0], jammer_zone[2]);
+        jlon_min = std::min(jammer_zone[1], jammer_zone[3]);
+        jlon_max = std::max(jammer_zone[1], jammer_zone[3]);
+    }
+
+    // Линия маршрута: красная если оценённая позиция внутри зоны глушения
     for (size_t i = 1; i < pts.size(); ++i) {
-        cv::Scalar col = traj[i].gps_denied
-                         ? cv::Scalar(0, 220, 255)   // жёлтый = TRN без GPS
-                         : cv::Scalar(30, 30, 220);   // красный = штатный TRN
+        bool in_jammer = has_jammer &&
+            traj[i].lat >= jlat_min && traj[i].lat <= jlat_max &&
+            traj[i].lon >= jlon_min && traj[i].lon <= jlon_max;
+        cv::Scalar col = in_jammer
+                         ? cv::Scalar(30, 30, 220)   // красный внутри зоны
+                         : cv::Scalar(0, 220, 255);  // жёлтый вне зоны
         cv::line(vis, pts[i-1], pts[i], cv::Scalar(255, 255, 255), 5, cv::LINE_AA);
         cv::line(vis, pts[i-1], pts[i], col, 3, cv::LINE_AA);
     }
@@ -179,8 +202,6 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
     }
 
     // Старт — зелёный заливной круг с белой рамкой (рисуем ПОСЛЕ линии, поверх)
-    auto [sx, sy] = DemLoader::geo_to_pixel(dem.gt, start_lat, start_lon);
-    cv::Point sp{static_cast<int>(std::round(sx)), static_cast<int>(std::round(sy))};
     cv::circle(vis, sp, 11, cv::Scalar(255, 255, 255), -1);
     cv::circle(vis, sp, 9,  cv::Scalar(30, 210, 30),  -1);
 
@@ -196,7 +217,36 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(220,100,40), 1);
     }
 
-    // Ограничить размер выходного изображения (3600×3600 → слишком большой файл)
+    // --- Обрезать до области маршрута + margin ---
+    if (!pts.empty()) {
+        // Pixel bbox всех точек (включая старт)
+        int xmin = sp.x, xmax = sp.x, ymin = sp.y, ymax = sp.y;
+        for (const auto& p : pts) {
+            xmin = std::min(xmin, p.x); xmax = std::max(xmax, p.x);
+            ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y);
+        }
+        // Также включить зону глушения в bbox
+        if (jammer_zone.size() == 4) {
+            auto [jx1, jy1] = DemLoader::geo_to_pixel(dem.gt, jammer_zone[0], jammer_zone[1]);
+            auto [jx2, jy2] = DemLoader::geo_to_pixel(dem.gt, jammer_zone[2], jammer_zone[3]);
+            xmin = std::min(xmin, (int)std::round(std::min(jx1,jx2)));
+            xmax = std::max(xmax, (int)std::round(std::max(jx1,jx2)));
+            ymin = std::min(ymin, (int)std::round(std::min(jy1,jy2)));
+            ymax = std::max(ymax, (int)std::round(std::max(jy1,jy2)));
+        }
+        // Добавить margin ~4 км в пикселях (+30% к прежнему 3 км)
+        double mpp_y = DemLoader::meters_per_pixel_y(dem.gt);
+        int margin_px = static_cast<int>(4000.0 / mpp_y);
+        int cx1 = std::max(0, xmin - margin_px);
+        int cy1 = std::max(0, ymin - margin_px);
+        int cx2 = std::min(W - 1, xmax + margin_px);
+        int cy2 = std::min(H - 1, ymax + margin_px);
+        cv::Rect roi(cx1, cy1, cx2 - cx1, cy2 - cy1);
+        if (roi.width > 0 && roi.height > 0)
+            vis = vis(roi).clone();
+    }
+
+    // Ограничить размер выходного изображения
     constexpr int MAX_DIM = 2048;
     if (vis.rows > MAX_DIM || vis.cols > MAX_DIM) {
         double scale = static_cast<double>(MAX_DIM) / std::max(vis.rows, vis.cols);

@@ -36,19 +36,30 @@ def nmea_checksum(sentence: str) -> str:
 
 
 def format_gpgga(dt: datetime, radio_alt_m: float, baro_alt_m: float,
-                 quality: int = 1) -> str:
+                 quality: int = 1,
+                 lat: float = 0.0, lon: float = 0.0) -> str:
     """
     Формирует GPGGA строку.
     quality: 1 = GPS доступен, 0 = GPS отсутствует (зона глушения).
-    radio_alt_m — высота над рельефом (поле 9).
-    baro_alt_m  — абсолютная высота полёта (поле 11, geoid separation).
+    При quality>0 вписывает реальные координаты lat/lon.
     """
     time_str = dt.strftime("%H%M%S.") + f"{dt.microsecond // 1000:03d}"
-    # GPGGA field layout: 0=GPGGA 1=time 2=lat 3=N/S 4=lon 5=E/W
-    #   6=quality 7=sats 8=HDOP 9=alt 10=M 11=geoid 12=M 13=age 14=id
-    body = (
-        f"GPGGA,{time_str},,,,,{quality},,,{radio_alt_m:.1f},M,{baro_alt_m:.1f},M,,"
-    )
+    if quality > 0:
+        # Перевести десятичные градусы → DDMM.MMMMM
+        def deg2nmea(d, is_lon=False):
+            d = abs(d)
+            deg = int(d)
+            minutes = (d - deg) * 60.0
+            width = 3 if is_lon else 2
+            return f"{deg:0{width}d}{minutes:08.5f}"
+        lat_s = deg2nmea(lat)
+        lat_h = "N" if lat >= 0 else "S"
+        lon_s = deg2nmea(lon, is_lon=True)
+        lon_h = "E" if lon >= 0 else "W"
+        body = (f"GPGGA,{time_str},{lat_s},{lat_h},{lon_s},{lon_h},"
+                f"{quality},08,1.0,{radio_alt_m:.1f},M,{baro_alt_m:.1f},M,,")
+    else:
+        body = (f"GPGGA,{time_str},,,,,{quality},,,{radio_alt_m:.1f},M,{baro_alt_m:.1f},M,,")
     cs = nmea_checksum(body)
     return f"${body}*{cs}"
 
@@ -104,6 +115,8 @@ def main():
                         help="Зона глушения GPS: lat1,lon1,lat2,lon2")
     parser.add_argument("--out",          default="flight.nmea",     help="Выходной файл NMEA")
     parser.add_argument("--seed",         type=int,   default=42,    help="Зерно генератора")
+    parser.add_argument("--sin-exp-amplitude", type=float, default=0.0,
+                        help="Амплитуда формы sin(x)+0.1e^x (м боковое отклонение). 0=выкл")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -156,7 +169,7 @@ def main():
         quality = 0 if inside_jammer(lat, lon, jammer_zone) else 1
 
         dt_cur = dt_start + timedelta(seconds=i * step_s)
-        nmea_lines.append(format_gpgga(dt_cur, radio_alt, args.baro, quality))
+        nmea_lines.append(format_gpgga(dt_cur, radio_alt, args.baro, quality, lat, lon))
 
         # Ground truth
         gt_rows.append({
@@ -174,13 +187,25 @@ def main():
                   ou_sigma * math.sqrt(step_s) * random.gauss(0, 1)
         speed = max(v_min, min(v_max, speed))
 
-        # Обновить курс
-        if args.heading_sigma > 0:
-            heading += random.gauss(0, args.heading_sigma)
-            heading %= 360.0
-
-        # Сдвинуть позицию
+        # Расстояние шага нужно до обновления курса (для sin-exp)
         dist_step = speed * step_s
+
+        # Обновить курс
+        if args.sin_exp_amplitude > 0:
+            # Предписанный курс из производной sin(x)+0.1*e^x
+            # x пробегает [-1.5, 4.0] по мере продвижения маршрута
+            x_i = -1.5 + 5.5 * (i / max(n_steps - 1, 1))
+            dydx = math.cos(x_i) + 0.1 * math.exp(x_i)
+            dx_per_step = 5.5 / max(n_steps - 1, 1)
+            lateral_m = args.sin_exp_amplitude * dydx * dx_per_step  # м/шаг вбок
+            heading = args.azimuth + math.degrees(math.atan2(lateral_m, dist_step))
+            if args.heading_sigma > 0:
+                heading += random.gauss(0, args.heading_sigma)
+        else:
+            if args.heading_sigma > 0:
+                heading += random.gauss(0, args.heading_sigma)
+        heading %= 360.0
+
         lat, lon = move(lat, lon, heading, dist_step)
 
     # Записать NMEA

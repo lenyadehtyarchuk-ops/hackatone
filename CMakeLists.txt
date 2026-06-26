@@ -20,6 +20,7 @@ add_executable(trn
     src/dem_loader.cpp
     src/terrain_correlator.cpp
     src/kalman_filter.cpp
+    src/particle_filter.cpp
     src/visualizer.cpp
 )
 
