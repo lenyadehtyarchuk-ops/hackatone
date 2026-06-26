@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <opencv2/imgproc.hpp>
 
-static constexpr double NCC_CONFIDENCE_THRESHOLD = 0.85;
-static constexpr double FLAT_TERRAIN_STD_M       = 5.0;  // профиль с σ < 5 м = слишком плоский
+static constexpr double NCC_CONFIDENCE_THRESHOLD = 0.80;  // для σ_датчика=2м
+static constexpr double FLAT_TERRAIN_STD_M       = 5.0;
 
 TerrainCorrelator::TerrainCorrelator(const DemData& dem, const CorrelatorConfig& cfg)
     : m_dem(&dem), m_cfg(cfg)
@@ -16,29 +16,42 @@ std::optional<CorrelationResult> TerrainCorrelator::add_measurement(double radio
     double terrain_h = m_cfg.baro_alt_m - radio_alt_m;
     m_measured.push_back(terrain_h);
 
+    // Накапливаем градиентный профиль: разность с предыдущей точкой
+    if (m_measured.size() >= 2) {
+        m_grad.push_back(m_measured.back() - m_measured[m_measured.size() - 2]);
+    }
+
     if (static_cast<int>(m_measured.size()) >= m_cfg.min_profile_len)
         return run_search();
     return std::nullopt;
 }
 
-std::vector<float> TerrainCorrelator::extract_profile(
+// --- Извлечение профиля из ЦМР ---
+struct ExtractedProfile {
+    std::vector<float> elev;  // сырые высоты
+    std::vector<float> grad;  // градиент: elev[k] - elev[k-1]
+};
+
+static ExtractedProfile extract_profile_full(
+    const DemData& dem,
     double start_lat, double start_lon,
     double azimuth_deg, int n_points,
-    double step_px_x, double step_px_y) const
+    double step_px_x, double step_px_y)
 {
     double az_rad = azimuth_deg * M_PI / 180.0;
     double dpx =  std::sin(az_rad) * step_px_x;
     double dpy = -std::cos(az_rad) * step_px_y;
 
-    auto [px0, py0] = DemLoader::geo_to_pixel(m_dem->gt, start_lat, start_lon);
+    auto [px0, py0] = DemLoader::geo_to_pixel(dem.gt, start_lat, start_lon);
 
-    int nx = m_dem->elev.cols;
-    int ny = m_dem->elev.rows;
+    int nx = dem.elev.cols;
+    int ny = dem.elev.rows;
 
-    std::vector<float> profile;
-    profile.reserve(n_points);
+    ExtractedProfile result;
+    result.elev.reserve(n_points);
 
     double px = px0, py = py0;
+    float prev = 0.0f;
     for (int i = 0; i < n_points; ++i) {
         int xi = static_cast<int>(px);
         int yi = static_cast<int>(py);
@@ -46,19 +59,24 @@ std::vector<float> TerrainCorrelator::extract_profile(
         if (xi >= 0 && yi >= 0 && xi < nx - 1 && yi < ny - 1) {
             float dx = static_cast<float>(px - xi);
             float dy = static_cast<float>(py - yi);
-            val = m_dem->elev.at<float>(yi,   xi  ) * (1-dx)*(1-dy)
-                + m_dem->elev.at<float>(yi,   xi+1) * dx*(1-dy)
-                + m_dem->elev.at<float>(yi+1, xi  ) * (1-dx)*dy
-                + m_dem->elev.at<float>(yi+1, xi+1) * dx*dy;
+            val = dem.elev.at<float>(yi,   xi  ) * (1-dx)*(1-dy)
+                + dem.elev.at<float>(yi,   xi+1) * dx*(1-dy)
+                + dem.elev.at<float>(yi+1, xi  ) * (1-dx)*dy
+                + dem.elev.at<float>(yi+1, xi+1) * dx*dy;
         }
-        profile.push_back(val);
+        result.elev.push_back(val);
+        if (i > 0) result.grad.push_back(val - prev);
+        prev = val;
         px += dpx;
         py += dpy;
     }
-    return profile;
+    return result;
 }
 
-std::vector<float> TerrainCorrelator::ncc_sliding_weighted(
+// --- Взвешенная нормированная кросс-корреляция ---
+// measured[0..n-1], reference[0..m-1], m >= n
+// Возвращает вектор NCC для каждого смещения d=0..m-n
+static std::vector<float> ncc_sliding_weighted(
     const std::vector<double>& measured,
     const std::vector<float>&  reference,
     const std::vector<double>& weights)
@@ -67,7 +85,6 @@ std::vector<float> TerrainCorrelator::ncc_sliding_weighted(
     int m = static_cast<int>(reference.size());
     if (m < n) return {};
 
-    // Взвешенные статистики измеренного профиля (не зависят от смещения d)
     double W = 0;
     for (double w : weights) W += w;
 
@@ -107,6 +124,16 @@ std::vector<float> TerrainCorrelator::ncc_sliding_weighted(
     return result;
 }
 
+// Для градиентного канала measured — m_grad (double), reference — ref.grad (float)
+// Градиент на 1 точку короче профиля, поэтому передаём n-1 элементов
+static std::vector<float> ncc_grad_channel(
+    const std::vector<double>& meas_grad,  // длина n-1
+    const std::vector<float>&  ref_grad,   // длина m-1
+    const std::vector<double>& weights_g)  // длина n-1
+{
+    return ncc_sliding_weighted(meas_grad, ref_grad, weights_g);
+}
+
 std::optional<CorrelationResult> TerrainCorrelator::run_search() {
     int n = static_cast<int>(m_measured.size());
     if (n < m_cfg.min_profile_len) return std::nullopt;
@@ -117,12 +144,12 @@ std::optional<CorrelationResult> TerrainCorrelator::run_search() {
     double step_px_x = step_m / mpp_x;
     double step_px_y = step_m / mpp_y;
 
-    int search_px = static_cast<int>(m_cfg.search_radius_m / step_m);
-    int ref_len   = n + search_px;
-    int n_azimuths = 360 / m_cfg.azimuth_step_deg;
+    int search_px  = static_cast<int>(m_cfg.search_radius_m / step_m);
+    int ref_len    = n + search_px;
     int n_offsets  = search_px + 1;
+    int n_azimuths = 360 / m_cfg.azimuth_step_deg;
 
-    // Вычислить σ измеренного профиля (информативность рельефа)
+    // σ измеренного профиля (для low_confidence)
     double mean_m = 0;
     for (double v : m_measured) mean_m += v;
     mean_m /= n;
@@ -130,11 +157,28 @@ std::optional<CorrelationResult> TerrainCorrelator::run_search() {
     for (double v : m_measured) std_m += (v - mean_m) * (v - mean_m);
     std_m = std::sqrt(std_m / n);
 
-    // Веса: w[k] = |M[k] - mean_M| + epsilon
-    // Точки далеко от среднего (пики, долины) получают больший вес
-    std::vector<double> weights(n);
+    // Веса для высотного канала
+    std::vector<double> weights_h(n);
     for (int k = 0; k < n; ++k)
-        weights[k] = std::abs(m_measured[k] - mean_m) + 1.0;
+        weights_h[k] = std::abs(m_measured[k] - mean_m) + 1.0;
+
+    // Веса для градиентного канала (по самому градиенту)
+    int ng = static_cast<int>(m_grad.size());   // ng = n-1
+    std::vector<double> weights_g;
+    if (ng > 0) {
+        double mean_g = 0;
+        for (double v : m_grad) mean_g += v;
+        mean_g /= ng;
+        weights_g.resize(ng);
+        for (int k = 0; k < ng; ++k)
+            weights_g[k] = std::abs(m_grad[k] - mean_g) + 1.0;
+    }
+
+    double alpha_h = 1.0 - m_cfg.gradient_weight;  // вес высотного канала
+    double alpha_g = m_cfg.gradient_weight;          // вес градиентного канала
+
+    // Секторный поиск: если prior_heading задан, ограничиваем азимут
+    bool use_sector = (m_cfg.prior_heading_deg >= 0.0);
 
     cv::Mat corr_map(n_azimuths, n_offsets, CV_32F, cv::Scalar(0));
     double best_ncc = -2.0;
@@ -142,16 +186,40 @@ std::optional<CorrelationResult> TerrainCorrelator::run_search() {
 
     for (int ai = 0; ai < n_azimuths; ++ai) {
         double az = ai * m_cfg.azimuth_step_deg;
-        auto ref = extract_profile(m_cfg.start_lat, m_cfg.start_lon,
-                                   az, ref_len, step_px_x, step_px_y);
-        if (static_cast<int>(ref.size()) < n) continue;
 
-        auto ncc_vec = ncc_sliding_weighted(m_measured, ref, weights);
+        // Пропустить, если за пределами сектора (с учётом цикличности 360°)
+        if (use_sector) {
+            double az_norm = az;
+            // Привести az к диапазону [prior_heading - 180, prior_heading + 180]
+            double center = m_cfg.prior_heading_deg;
+            while (az_norm - center > 180.0)  az_norm -= 360.0;
+            while (az_norm - center < -180.0) az_norm += 360.0;
+            if (std::abs(az_norm - center) > m_cfg.heading_search_deg) continue;
+        }
 
-        for (int d = 0; d < static_cast<int>(ncc_vec.size()) && d < n_offsets; ++d) {
-            corr_map.at<float>(ai, d) = ncc_vec[d];
-            if (ncc_vec[d] > best_ncc) {
-                best_ncc = ncc_vec[d];
+        auto ref = extract_profile_full(*m_dem,
+                                        m_cfg.start_lat, m_cfg.start_lon,
+                                        az, ref_len, step_px_x, step_px_y);
+        if (static_cast<int>(ref.elev.size()) < n) continue;
+
+        // Высотный канал
+        auto ncc_h = ncc_sliding_weighted(m_measured, ref.elev, weights_h);
+
+        // Градиентный канал (если включён и есть данные)
+        std::vector<float> ncc_g;
+        if (alpha_g > 1e-6 && ng > 0 &&
+            static_cast<int>(ref.grad.size()) >= ng) {
+            ncc_g = ncc_grad_channel(m_grad, ref.grad, weights_g);
+        }
+
+        for (int d = 0; d < static_cast<int>(ncc_h.size()) && d < n_offsets; ++d) {
+            float combined = static_cast<float>(alpha_h) * ncc_h[d];
+            if (!ncc_g.empty() && d < static_cast<int>(ncc_g.size()))
+                combined += static_cast<float>(alpha_g) * ncc_g[d];
+
+            corr_map.at<float>(ai, d) = combined;
+            if (combined > best_ncc) {
+                best_ncc = combined;
                 best_az  = ai * m_cfg.azimuth_step_deg;
                 best_off = d;
             }

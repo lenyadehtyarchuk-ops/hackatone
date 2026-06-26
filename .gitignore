@@ -1,6 +1,8 @@
 build/
 data/dem/
 data/nmea/steppe_flight.nmea
+data/nmea/elbrus_noise2.nmea
+data/nmea/elbrus_noise2_gt.csv
 __pycache__/
 *.pyc
 *.o

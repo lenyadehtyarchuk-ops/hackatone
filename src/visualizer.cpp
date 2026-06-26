@@ -49,7 +49,8 @@ void Visualizer::save_correlation_heatmap(const cv::Mat& corr_map,
 void Visualizer::save_trajectory_on_dem(const DemData& dem,
                                          const std::vector<TrajectoryPoint>& traj,
                                          double start_lat, double start_lon,
-                                         const std::string& path)
+                                         const std::string& path,
+                                         const std::vector<double>& jammer_zone)
 {
     if (dem.elev.empty() || traj.empty()) return;
 
@@ -128,6 +129,29 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
         }
     }
 
+    // --- Зона глушения GPS (полупрозрачный красный прямоугольник) ---
+    if (jammer_zone.size() == 4) {
+        auto [jx1, jy1] = DemLoader::geo_to_pixel(dem.gt, jammer_zone[0], jammer_zone[1]);
+        auto [jx2, jy2] = DemLoader::geo_to_pixel(dem.gt, jammer_zone[2], jammer_zone[3]);
+        cv::Point jp1{static_cast<int>(std::round(std::min(jx1,jx2))),
+                      static_cast<int>(std::round(std::min(jy1,jy2)))};
+        cv::Point jp2{static_cast<int>(std::round(std::max(jx1,jx2))),
+                      static_cast<int>(std::round(std::max(jy1,jy2)))};
+        // Полупрозрачная заливка (blend)
+        cv::Mat overlay = vis.clone();
+        cv::rectangle(overlay, jp1, jp2, cv::Scalar(0, 0, 180), -1);
+        cv::addWeighted(overlay, 0.30, vis, 0.70, 0, vis);
+        // Рамка
+        cv::rectangle(vis, jp1, jp2, cv::Scalar(0, 0, 255), 2);
+        // Подпись
+        cv::putText(vis, "GPS DENIED",
+                    jp1 + cv::Point(4, 18),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,0,0), 3);
+        cv::putText(vis, "GPS DENIED",
+                    jp1 + cv::Point(4, 18),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(60,60,255), 1);
+    }
+
     // --- Пиксельные координаты точек траектории ---
     std::vector<cv::Point> pts;
     for (const auto& p : traj) {
@@ -136,10 +160,13 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                        static_cast<int>(std::round(py))});
     }
 
-    // Линия маршрута: белая обводка + красная
+    // Линия маршрута: белая обводка + красная (TRN) / жёлтая (GPS-denied участок)
     for (size_t i = 1; i < pts.size(); ++i) {
+        cv::Scalar col = traj[i].gps_denied
+                         ? cv::Scalar(0, 220, 255)   // жёлтый = TRN без GPS
+                         : cv::Scalar(30, 30, 220);   // красный = штатный TRN
         cv::line(vis, pts[i-1], pts[i], cv::Scalar(255, 255, 255), 5, cv::LINE_AA);
-        cv::line(vis, pts[i-1], pts[i], cv::Scalar(30, 30, 220),   3, cv::LINE_AA);
+        cv::line(vis, pts[i-1], pts[i], col, 3, cv::LINE_AA);
     }
 
     // Финиш — синий заливной квадрат с белой рамкой
@@ -167,6 +194,13 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,0,0),   3);
         cv::putText(vis, "End", pts.back() + cv::Point(13, 4),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(220,100,40), 1);
+    }
+
+    // Ограничить размер выходного изображения (3600×3600 → слишком большой файл)
+    constexpr int MAX_DIM = 2048;
+    if (vis.rows > MAX_DIM || vis.cols > MAX_DIM) {
+        double scale = static_cast<double>(MAX_DIM) / std::max(vis.rows, vis.cols);
+        cv::resize(vis, vis, cv::Size(), scale, scale, cv::INTER_AREA);
     }
 
     cv::imwrite(path, vis);

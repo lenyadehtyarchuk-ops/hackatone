@@ -66,9 +66,10 @@ std::optional<NmeaFix> NmeaParser::parse_gpgga(const std::string& raw_line) {
 
     NmeaFix fix{};
     try {
-        fix.timestamp_s = fields[1].empty() ? 0.0 : parse_hhmmss(fields[1]);
-        fix.radio_alt_m = fields[9].empty() ? 0.0 : std::stod(fields[9]);
-        fix.baro_alt_m  = fields[11].empty() ? 0.0 : std::stod(fields[11]);
+        fix.timestamp_s  = fields[1].empty() ? 0.0 : parse_hhmmss(fields[1]);
+        fix.gps_quality  = fields[6].empty() ? 1   : std::stoi(fields[6]);
+        fix.radio_alt_m  = fields[9].empty() ? 0.0 : std::stod(fields[9]);
+        fix.baro_alt_m   = fields[11].empty() ? 0.0 : std::stod(fields[11]);
     } catch (...) {
         return std::nullopt;
     }

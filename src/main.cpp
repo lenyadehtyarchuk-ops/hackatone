@@ -1,7 +1,9 @@
 #include <iostream>
 #include <filesystem>
+#include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <stdexcept>
@@ -26,8 +28,9 @@ struct Config {
     int         az_step         = 1;
     std::string out_dir         = "results";
     bool        show_gui        = false;
-    // Обновлять стартовую точку после каждого решения (скользящий алгоритм)
     bool        sliding         = false;
+    // Зона глушения GPS: lat1,lon1,lat2,lon2 (пустая = нет зоны)
+    std::vector<double> jammer_zone;
 };
 
 static void print_usage(const char* prog) {
@@ -46,18 +49,30 @@ static Config parse_args(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error("Missing value for " + a);
             return argv[++i];
         };
-        if      (a == "--dem")         cfg.dem_path      = next();
-        else if (a == "--nmea")        cfg.nmea_path     = next();
-        else if (a == "--baro")        cfg.baro_alt_m    = std::stod(next());
-        else if (a == "--lat")         cfg.start_lat     = std::stod(next());
-        else if (a == "--lon")         cfg.start_lon     = std::stod(next());
-        else if (a == "--speed")       cfg.speed_mps     = std::stod(next());
-        else if (a == "--radius")      cfg.search_radius_m = std::stod(next());
-        else if (a == "--min-profile") cfg.min_profile   = std::stoi(next());
-        else if (a == "--az-step")     cfg.az_step       = std::stoi(next());
-        else if (a == "--out")         cfg.out_dir       = next();
-        else if (a == "--gui")         cfg.show_gui      = true;
-        else if (a == "--sliding")     cfg.sliding       = true;
+        if      (a == "--dem")          cfg.dem_path        = next();
+        else if (a == "--nmea")         cfg.nmea_path       = next();
+        else if (a == "--baro")         cfg.baro_alt_m      = std::stod(next());
+        else if (a == "--lat")          cfg.start_lat       = std::stod(next());
+        else if (a == "--lon")          cfg.start_lon       = std::stod(next());
+        else if (a == "--speed")        cfg.speed_mps       = std::stod(next());
+        else if (a == "--radius")       cfg.search_radius_m = std::stod(next());
+        else if (a == "--min-profile")  cfg.min_profile     = std::stoi(next());
+        else if (a == "--az-step")      cfg.az_step         = std::stoi(next());
+        else if (a == "--out")          cfg.out_dir         = next();
+        else if (a == "--gui")          cfg.show_gui        = true;
+        else if (a == "--sliding")      cfg.sliding         = true;
+        else if (a == "--jammer-zone") {
+            // Формат: lat1,lon1,lat2,lon2
+            std::string val = next();
+            std::replace(val.begin(), val.end(), ',', ' ');
+            std::istringstream ss(val);
+            double v;
+            while (ss >> v) cfg.jammer_zone.push_back(v);
+            if (cfg.jammer_zone.size() != 4) {
+                std::cerr << "ERROR: --jammer-zone требует 4 числа: lat1,lon1,lat2,lon2\n";
+                std::exit(1);
+            }
+        }
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); std::exit(0); }
         else { std::cerr << "Unknown arg: " << a << "\n"; print_usage(argv[0]); std::exit(1); }
     }
@@ -113,14 +128,17 @@ int main(int argc, char** argv) {
 
     // Инициализировать коррелятор
     CorrelatorConfig ccfg;
-    ccfg.start_lat       = cfg.start_lat;
-    ccfg.start_lon       = cfg.start_lon;
-    ccfg.baro_alt_m      = cfg.baro_alt_m;
-    ccfg.speed_mps       = cfg.speed_mps;
-    ccfg.sample_dt_s     = dt_s;
-    ccfg.min_profile_len = cfg.min_profile;
-    ccfg.search_radius_m = cfg.search_radius_m;
+    ccfg.start_lat        = cfg.start_lat;
+    ccfg.start_lon        = cfg.start_lon;
+    ccfg.baro_alt_m       = cfg.baro_alt_m;
+    ccfg.speed_mps        = cfg.speed_mps;
+    ccfg.sample_dt_s      = dt_s;
+    ccfg.min_profile_len  = cfg.min_profile;
+    ccfg.search_radius_m  = cfg.search_radius_m;
     ccfg.azimuth_step_deg = cfg.az_step;
+    ccfg.gradient_weight  = 0.4;   // 40% градиент, 60% высота
+    ccfg.prior_heading_deg = -1.0; // -1 = полный 360° поиск до первого решения
+    ccfg.heading_search_deg = 45.0;
 
     TerrainCorrelator correlator(dem, ccfg);
 
@@ -180,6 +198,7 @@ int main(int argc, char** argv) {
         tp.heading_deg = kf.is_initialized() ? kf.heading_deg()
                                               : static_cast<double>(res->best_azimuth_deg);
         tp.ncc         = res->best_ncc;
+        tp.gps_denied  = (fix.gps_quality == 0);
         trajectory.push_back(tp);
 
         std::cout << std::fixed << std::setprecision(6)
@@ -200,10 +219,13 @@ int main(int argc, char** argv) {
                   << " hdg=" << tp.heading_deg << "°"
                   << " NCC=" << res->best_ncc << "\n";
 
-        // В скользящем режиме сдвигаем стартовую точку к найденной позиции
-        if (cfg.sliding) {
+        // В скользящем режиме сдвигаем стартовую точку только при принятом решении.
+        // При dead reckoning оставляем последнюю надёжную стартовую точку.
+        if (cfg.sliding && accept) {
             ccfg.start_lat = res->current_lat;
             ccfg.start_lon = res->current_lon;
+            if (kf.is_initialized())
+                ccfg.prior_heading_deg = kf.heading_deg();
             correlator = TerrainCorrelator(dem, ccfg);
         }
     }
@@ -221,7 +243,7 @@ int main(int argc, char** argv) {
             std::string traj_path = cfg.out_dir + "/trajectory.png";
             Visualizer::save_trajectory_on_dem(dem, trajectory,
                                                 cfg.start_lat, cfg.start_lon,
-                                                traj_path);
+                                                traj_path, cfg.jammer_zone);
         }
     }
 
