@@ -9,30 +9,37 @@ ContourPF::ContourPF(const DemData& dem, const KeypointDB& kpdb,
                      double start_lat, double start_lon,
                      double heading_deg, double speed_mps,
                      int n, double pos_sigma_m, double hdg_sigma_deg,
-                     const RidgeMap* rm)
+                     const RidgeMap* rm,
+                     double yaw_rate_dps, double yaw_sigma_dps)
     : dem_(dem), kpdb_(kpdb), rm_(rm), rng_(42), n_(n)
 {
     p_.resize(n);
     std::normal_distribution<float> pd(0.0f, static_cast<float>(pos_sigma_m));
     std::normal_distribution<float> hd(0.0f, static_cast<float>(hdg_sigma_deg));
     std::normal_distribution<float> sd(0.0f, 3.0f);
+    std::normal_distribution<float> yd(0.0f, static_cast<float>(yaw_sigma_dps));
     float cos_lat = std::cos(static_cast<float>(start_lat) * DEG2RAD);
     float uw = 1.0f / static_cast<float>(n);
     for (auto& pt : p_) {
-        pt.lat         = static_cast<float>(start_lat) + pd(rng_) / 111320.0f;
-        pt.lon         = static_cast<float>(start_lon) + pd(rng_) / (111320.0f * cos_lat);
-        pt.heading_deg = std::fmod(static_cast<float>(heading_deg) + hd(rng_) + 360.0f, 360.0f);
-        pt.speed_mps   = std::max(5.0f, static_cast<float>(speed_mps) + sd(rng_));
-        pt.weight      = uw;
+        pt.lat          = static_cast<float>(start_lat) + pd(rng_) / 111320.0f;
+        pt.lon          = static_cast<float>(start_lon) + pd(rng_) / (111320.0f * cos_lat);
+        pt.heading_deg  = std::fmod(static_cast<float>(heading_deg) + hd(rng_) + 360.0f, 360.0f);
+        pt.speed_mps    = std::max(5.0f, static_cast<float>(speed_mps) + sd(rng_));
+        pt.yaw_rate_dps = static_cast<float>(yaw_rate_dps) + yd(rng_);
+        pt.weight       = uw;
     }
 }
 
 void ContourPF::predict(double dt_s, double hdg_noise, double spd_noise) {
     std::normal_distribution<float> hn(0.0f, static_cast<float>(hdg_noise));
     std::normal_distribution<float> sn(0.0f, static_cast<float>(spd_noise));
+    // yaw_rate slowly drifts so it can adapt if the path changes character
+    std::normal_distribution<float> yn(0.0f, 0.03f);
     float dt = static_cast<float>(dt_s);
     for (auto& pt : p_) {
-        pt.heading_deg = std::fmod(pt.heading_deg + hn(rng_) + 360.0f, 360.0f);
+        pt.yaw_rate_dps += yn(rng_);
+        pt.heading_deg = std::fmod(
+            pt.heading_deg + pt.yaw_rate_dps * dt + hn(rng_) + 360.0f, 360.0f);
         pt.speed_mps   = std::max(5.0f, pt.speed_mps + sn(rng_));
         float az      = pt.heading_deg * DEG2RAD;
         float dist    = pt.speed_mps * dt;
@@ -210,13 +217,62 @@ void ContourPF::resample() {
     p_ = std::move(next);
 }
 
+// Gradient-based slope constraint.
+// For each particle: project DEM gradient at particle position onto its heading
+// direction → predicted terrain slope for this step.  Weight particles by
+// exp(-(meas_slope - pred_slope)² / 2σ²).
+// When terrain is flat, pred_slope ≈ 0 ≈ meas_slope → weights nearly uniform
+// → no effect.  On hilly terrain, wrong-heading particles get low weight →
+// heading converges to the direction that matches the measured slope.
+void ContourPF::slope_update(float meas_slope_m, float dt_s, float sigma_m) {
+    float inv2s2 = 1.0f / (2.0f * sigma_m * sigma_m);
+    constexpr float EPS = 0.0005f;  // ~55 m, ~2 DEM pixels for gradient
+    float total_w = 0.0f;
+
+    for (auto& pt : p_) {
+        float cos_lat = std::cos(pt.lat * DEG2RAD);
+        float eps_lon = EPS / cos_lat;
+
+        float h_n = DemLoader::sample(dem_, pt.lat + EPS, pt.lon,       -9999.0f);
+        float h_s = DemLoader::sample(dem_, pt.lat - EPS, pt.lon,       -9999.0f);
+        float h_e = DemLoader::sample(dem_, pt.lat,       pt.lon + eps_lon, -9999.0f);
+        float h_w = DemLoader::sample(dem_, pt.lat,       pt.lon - eps_lon, -9999.0f);
+
+        if (h_n < -9000.f || h_s < -9000.f || h_e < -9000.f || h_w < -9000.f) continue;
+
+        // DEM gradient in m/m (north and east components)
+        float g_north = (h_n - h_s) / (2.0f * EPS * 111320.0f);
+        float g_east  = (h_e - h_w) / (2.0f * eps_lon * 111320.0f * cos_lat);
+
+        // Project onto particle heading: pred slope per step
+        float az = pt.heading_deg * DEG2RAD;
+        float pred_slope = (g_north * std::cos(az) + g_east * std::sin(az))
+                           * pt.speed_mps * static_cast<float>(dt_s);
+
+        float r = meas_slope_m - pred_slope;
+        pt.weight *= std::exp(-r * r * inv2s2);
+        total_w += pt.weight;
+    }
+
+    if (total_w < 1e-30f) return;
+    float inv_w = 1.0f / total_w;
+    for (auto& pt : p_) pt.weight *= inv_w;
+}
+
 ContourPF::Estimate ContourPF::step(double agl_m, double baro_alt_m, double dt_s,
                                      double hdg_noise_deg, double spd_noise_mps,
                                      double meas_sigma_m) {
-    predict(dt_s, hdg_noise_deg, spd_noise_mps);
+    float terrain_h = static_cast<float>(baro_alt_m - agl_m);
+    float meas_slope = (prev_terrain_h_ > -9000.0f)
+                       ? (terrain_h - prev_terrain_h_) : 0.0f;
+    prev_terrain_h_ = terrain_h;
 
-    float expected_terrain = static_cast<float>(baro_alt_m - agl_m);
-    contour_update(expected_terrain, static_cast<float>(meas_sigma_m));
+    predict(dt_s, hdg_noise_deg, spd_noise_mps);
+    contour_update(terrain_h, static_cast<float>(meas_sigma_m));
+    // slope_sigma is based on AGL sensor noise (~2m), NOT on position tolerance
+    // (meas_sigma_m is position tolerance, unrelated to slope measurement noise).
+    // sigma_slope = sqrt(2) * agl_noise ≈ 4m: slope is diff of two AGL readings.
+    slope_update(meas_slope, dt_s, 4.0f);
 
     agl_buf_.push_back(static_cast<float>(agl_m));
     if (static_cast<int>(agl_buf_.size()) > AGL_WIN)
