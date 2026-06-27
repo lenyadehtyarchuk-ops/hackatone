@@ -14,6 +14,8 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native")
 find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc imgcodecs highgui video)
 find_package(GDAL REQUIRED)
 
+find_package(OpenMP)
+
 add_executable(trn
     src/main.cpp
     src/nmea_parser.cpp
@@ -21,6 +23,10 @@ add_executable(trn
     src/terrain_correlator.cpp
     src/kalman_filter.cpp
     src/particle_filter.cpp
+    src/keypoint_db.cpp
+    src/contour_pf.cpp
+    src/ridge_map.cpp
+    src/line_navigator.cpp
     src/visualizer.cpp
 )
 
@@ -34,5 +40,10 @@ target_link_libraries(trn PRIVATE
     ${OpenCV_LIBS}
     ${GDAL_LIBRARIES}
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(trn PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP enabled")
+endif()
 
 target_compile_options(trn PRIVATE -Wall -Wextra -Wpedantic)

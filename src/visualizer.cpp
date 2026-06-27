@@ -6,43 +6,130 @@
 #include <iostream>
 #include <algorithm>
 
+// ── Вспомогательные форматировщики ──────────────────────────────────────────
+static std::string deg_sym() { return "deg"; }
+
+static std::string format_km(int off_idx, float step_m) {
+    if (step_m <= 0.0f) return std::to_string(off_idx);
+    float d_km = off_idx * step_m / 1000.0f;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f km", d_km);
+    return buf;
+}
+
+static std::string format_km_label(float dist_m) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.1f", dist_m / 1000.0f);
+    return buf;
+}
+
+static std::string format_ncc(float ncc) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%.3f", ncc);
+    return buf;
+}
+
 void Visualizer::save_correlation_heatmap(const cv::Mat& corr_map,
                                            const std::string& path,
-                                           int best_az, int best_off)
+                                           int best_az, int best_off,
+                                           float offset_step_m, float best_ncc)
 {
     if (corr_map.empty()) return;
 
-    // Нормализовать [-1, 1] → [0, 255]
-    cv::Mat norm;
-    cv::normalize(corr_map, norm, 0, 255, cv::NORM_MINMAX, CV_8U);
+    // corr_map: rows=azimuths, cols=offsets.
+    // Транспонируем → result rows=offsets, cols=azimuths.
+    // Итог: X-ось = азимут (0..360°), Y-ось = расстояние (0..N км).
+    cv::Mat tr;
+    cv::transpose(corr_map, tr);  // tr: rows=offsets, cols=azimuths
 
+    // Нормализовать [-1,1] → [0,255] → JET
+    cv::Mat norm;
+    cv::normalize(tr, norm, 0, 255, cv::NORM_MINMAX, CV_8U);
     cv::Mat colored;
     cv::applyColorMap(norm, colored, cv::COLORMAP_JET);
 
-    // Масштабировать для читабельности
-    int scale_x = std::max(1, 1200 / corr_map.cols);
-    int scale_y = std::max(1, 720  / corr_map.rows);
-    int scale = std::min(scale_x, scale_y);
-    if (scale > 1)
-        cv::resize(colored, colored, cv::Size(), scale, scale, cv::INTER_NEAREST);
+    // Целевой размер: ~1200×600
+    const int TARGET_W = 1200, TARGET_H = 600;
+    const int MARGIN_B = 40, MARGIN_T = 30, MARGIN_L = 65, MARGIN_R = 20;
+    int plot_w = TARGET_W - MARGIN_L - MARGIN_R;
+    int plot_h = TARGET_H - MARGIN_T - MARGIN_B;
+    cv::resize(colored, colored, cv::Size(plot_w, plot_h), 0, 0, cv::INTER_LINEAR);
 
-    // Отметить найденный максимум
-    if (best_az >= 0 && best_off >= 0) {
-        int px = best_off * scale + scale / 2;
-        int py = best_az  * scale + scale / 2;
-        cv::drawMarker(colored, {px, py}, cv::Scalar(255, 255, 255),
-                       cv::MARKER_CROSS, 15, 2);
+    // Холст с полями
+    cv::Mat canvas(TARGET_H, TARGET_W, CV_8UC3, cv::Scalar(30, 30, 30));
+    colored.copyTo(canvas(cv::Rect(MARGIN_L, MARGIN_T, plot_w, plot_h)));
+
+    // ── X-ось: азимут 0°–360° ──────────────────────────────────────────────
+    int n_az_ticks = corr_map.rows;  // = n_azimuths (до транспонирования)
+    for (int az : {0, 90, 180, 270, 360}) {
+        if (n_az_ticks <= 0) break;
+        int safe_az = std::min(az, n_az_ticks - 1);
+        int px = MARGIN_L + static_cast<int>(static_cast<float>(safe_az) / n_az_ticks * plot_w);
+        int py_bottom = MARGIN_T + plot_h;
+        cv::line(canvas, {px, py_bottom}, {px, py_bottom + 8},
+                 cv::Scalar(220,220,220), 2);
+        // grid line
+        cv::line(canvas, {px, MARGIN_T}, {px, py_bottom},
+                 cv::Scalar(60,60,60), 1);
+        std::string lbl = std::to_string(az);
+        int lw = (az == 360) ? 16 : 12;
+        cv::putText(canvas, lbl, {px - lw, py_bottom + 22},
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(230,230,230), 1);
+    }
+    cv::putText(canvas, "Azimuth",
+                {MARGIN_L + plot_w/2 - 35, TARGET_H - 4},
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(220,220,220), 1);
+
+    // ── Y-ось: расстояние ──────────────────────────────────────────────────
+    int n_off_rows = corr_map.cols;  // = n_offsets (до транспонирования)
+    if (n_off_rows > 0 && offset_step_m > 0.0f) {
+        float total_dist_m = n_off_rows * offset_step_m;
+        float step_km = (total_dist_m < 5000.0f) ? 0.5f : 1.0f;
+        float step_m  = step_km * 1000.0f;
+        for (float d = 0.0f; d <= total_dist_m + 1.0f; d += step_m) {
+            int py = MARGIN_T + static_cast<int>(d / total_dist_m * plot_h);
+            if (py > MARGIN_T + plot_h) break;
+            cv::line(canvas, {MARGIN_L - 8, py}, {MARGIN_L, py},
+                     cv::Scalar(220,220,220), 2);
+            // grid line
+            cv::line(canvas, {MARGIN_L, py}, {MARGIN_L + plot_w, py},
+                     cv::Scalar(60,60,60), 1);
+            std::string lbl = format_km_label(d) + " km";
+            cv::putText(canvas, lbl, {2, py + 5},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(230,230,230), 1);
+        }
     }
 
-    // Подписи осей
-    cv::putText(colored, "Offset (m) ->",
-                {10, colored.rows - 10}, cv::FONT_HERSHEY_SIMPLEX,
-                0.5, cv::Scalar(255,255,255), 1);
-    cv::putText(colored, "Azimuth (deg)",
-                {10, 20}, cv::FONT_HERSHEY_SIMPLEX,
-                0.5, cv::Scalar(255,255,255), 1);
+    // ── Отметить найденный максимум ─────────────────────────────────────────
+    if (best_az >= 0 && best_off >= 0) {
+        int n_az  = tr.cols;
+        int n_off = tr.rows;
+        float px_f = MARGIN_L + static_cast<float>(best_az)  / n_az  * plot_w;
+        float py_f = MARGIN_T + static_cast<float>(best_off) / n_off * plot_h;
+        cv::Point marker{static_cast<int>(px_f), static_cast<int>(py_f)};
 
-    cv::imwrite(path, colored);
+        // Белый крест с чёрной обводкой
+        cv::drawMarker(canvas, marker, cv::Scalar(0,0,0),
+                       cv::MARKER_CROSS, 30, 4, cv::LINE_AA);
+        cv::drawMarker(canvas, marker, cv::Scalar(255,255,255),
+                       cv::MARKER_CROSS, 28, 2, cv::LINE_AA);
+
+        // Подпись с непрозрачным фоном
+        std::string label = "az=" + std::to_string(best_az) + deg_sym()
+                          + "   NCC=" + format_ncc(best_ncc);
+        int tx = marker.x + 14, ty = marker.y - 10;
+        if (tx + 260 > TARGET_W) tx = marker.x - 270;
+        if (ty < MARGIN_T + 18)  ty = marker.y + 22;
+        // фон-прямоугольник
+        int baseline = 0;
+        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.65, 2, &baseline);
+        cv::rectangle(canvas, {tx - 4, ty - ts.height - 4}, {tx + ts.width + 4, ty + baseline + 4},
+                      cv::Scalar(10,10,10), cv::FILLED);
+        cv::putText(canvas, label, {tx, ty}, cv::FONT_HERSHEY_SIMPLEX,
+                    0.65, cv::Scalar(255,255,100), 2, cv::LINE_AA);
+    }
+
+    cv::imwrite(path, canvas);
     std::cerr << "[VIS] Тепловая карта сохранена: " << path << "\n";
 }
 
@@ -50,7 +137,10 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                                          const std::vector<TrajectoryPoint>& traj,
                                          double start_lat, double start_lon,
                                          const std::string& path,
-                                         const std::vector<double>& jammer_zone)
+                                         const std::vector<double>& jammer_zone,
+                                         double found_az_deg,
+                                         double found_dist_m,
+                                         double found_speed_mps)
 {
     if (dem.elev.empty() || traj.empty()) return;
 
@@ -215,6 +305,32 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,0,0),   3);
         cv::putText(vis, "End", pts.back() + cv::Point(13, 4),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(220,100,40), 1);
+    }
+
+    // --- Стрелка найденного азимута (TERCOM) ---
+    if (found_az_deg >= 0.0 && found_dist_m > 0.0) {
+        double az_rad = found_az_deg * M_PI / 180.0;
+        double cos_lat = std::cos(start_lat * M_PI / 180.0);
+        double end_lat = start_lat + found_dist_m * std::cos(az_rad) / 111320.0;
+        double end_lon = start_lon + found_dist_m * std::sin(az_rad) / (111320.0 * cos_lat);
+        auto [ex, ey] = DemLoader::geo_to_pixel(dem.gt, end_lat, end_lon);
+        cv::Point ep_arrow{static_cast<int>(std::round(ex)),
+                           static_cast<int>(std::round(ey))};
+        // Белая обводка + жёлтая стрелка
+        cv::arrowedLine(vis, sp, ep_arrow, cv::Scalar(255,255,255), 6, cv::LINE_AA, 0, 0.05);
+        cv::arrowedLine(vis, sp, ep_arrow, cv::Scalar(0, 220, 255), 3, cv::LINE_AA, 0, 0.05);
+        // Подпись у острия
+        std::string lbl;
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "az=%.0fdeg  v=%.0f m/s",
+                          found_az_deg, found_speed_mps);
+            lbl = buf;
+        }
+        cv::putText(vis, lbl, ep_arrow + cv::Point(10, -6),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,0,0), 3, cv::LINE_AA);
+        cv::putText(vis, lbl, ep_arrow + cv::Point(10, -6),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 220), 1, cv::LINE_AA);
     }
 
     // --- Обрезать до области маршрута + margin ---

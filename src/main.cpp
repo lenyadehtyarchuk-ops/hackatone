@@ -14,6 +14,10 @@
 #include "terrain_correlator.hpp"
 #include "kalman_filter.hpp"
 #include "particle_filter.hpp"
+#include "contour_pf.hpp"
+#include "keypoint_db.hpp"
+#include "ridge_map.hpp"
+#include "line_navigator.hpp"
 #include "visualizer.hpp"
 
 namespace fs = std::filesystem;
@@ -32,10 +36,18 @@ struct Config {
     std::string out_dir         = "results";
     bool        show_gui        = false;
     bool        sliding         = false;
-    bool        use_pf          = false;  // particle filter вместо TERCOM
-    int         pf_n            = 1000;   // число частиц
+    bool        use_pf          = false;  // profile particle filter
+    bool        use_cpf         = false;  // contour particle filter (новый, быстрый)
+    int         pf_n            = 1000;   // число частиц для PF
     double      pf_hdg_noise    = 8.0;   // шум курса (°/шаг)
-    double      pf_meas_sigma   = 4.0;   // σ измерения AGL для PF (чуть выше истинного)
+    double      pf_meas_sigma   = 4.0;   // σ для PF (профильный)
+    int         cpf_n           = 3000;  // число частиц для CPF
+    double      cpf_sigma       = 15.0;  // σ измерения для CPF (м)
+    int         cpf_kp_window   = 15;   // окно поиска экстремумов ЦМР (пиксели)
+    bool        use_lnav        = false; // line navigator (хребты/впадины)
+    bool        use_combined    = false; // CPF + RidgeMap ridge fixes
+    float       lnav_gauss      = 3.0f; // Gaussian sigma для Hessian (пикселей)
+    float       lnav_thresh     = 0.03f;// порог кривизны (доля от максимума)
     std::vector<double> jammer_zone;
 };
 
@@ -74,6 +86,14 @@ static Config parse_args(int argc, char** argv) {
         else if (a == "--pf-n")           cfg.pf_n            = std::stoi(next());
         else if (a == "--pf-hdg-noise")   cfg.pf_hdg_noise    = std::stod(next());
         else if (a == "--pf-meas-sigma")  cfg.pf_meas_sigma   = std::stod(next());
+        else if (a == "--cpf")            cfg.use_cpf         = true;
+        else if (a == "--cpf-n")          cfg.cpf_n           = std::stoi(next());
+        else if (a == "--cpf-sigma")      cfg.cpf_sigma       = std::stod(next());
+        else if (a == "--cpf-kp-window")  cfg.cpf_kp_window   = std::stoi(next());
+        else if (a == "--lnav")           cfg.use_lnav        = true;
+        else if (a == "--combined")       cfg.use_combined    = true;
+        else if (a == "--lnav-gauss")     cfg.lnav_gauss      = std::stof(next());
+        else if (a == "--lnav-thresh")    cfg.lnav_thresh     = std::stof(next());
         else if (a == "--jammer-zone") {
             std::string val = next();
             std::replace(val.begin(), val.end(), ',', ' ');
@@ -250,9 +270,26 @@ static int run_tercom(const Config& cfg, const DemData& dem,
 
     for (size_t i = 0; i < fixes.size(); ++i) {
         const auto& fix = fixes[i];
+        bool gps_ok = (fix.gps_quality > 0);
         kf.predict(dt_s);
 
         auto res = correlator.add_measurement(fix.radio_alt_m);
+
+        // GPS-точки всегда рисуем из реальных координат
+        if (gps_ok) {
+            TrajectoryPoint tp;
+            tp.lat        = fix.lat;
+            tp.lon        = fix.lon;
+            tp.speed_mps  = cfg.speed_mps;
+            tp.heading_deg = cfg.azimuth_deg;
+            tp.ncc        = 1.0;
+            tp.gps_denied = false;
+            trajectory.push_back(tp);
+            if (res) last_result = res;
+            continue;
+        }
+
+        // GPS-denied: нужна корреляция
         if (!res) continue;
         last_result = res;
 
@@ -288,7 +325,7 @@ static int run_tercom(const Config& cfg, const DemData& dem,
         tp.heading_deg = kf.is_initialized() ? kf.heading_deg()
                                              : static_cast<double>(res->best_azimuth_deg);
         tp.ncc        = res->best_ncc;
-        tp.gps_denied = (fix.gps_quality == 0);
+        tp.gps_denied = true;
         trajectory.push_back(tp);
 
         csv_out << std::fixed << std::setprecision(6)
@@ -317,18 +354,24 @@ static int run_tercom(const Config& cfg, const DemData& dem,
     }
 
     if (last_result) {
+        float offset_step_m = static_cast<float>(cfg.speed_mps * dt_s);
         Visualizer::save_correlation_heatmap(
             last_result->corr_map,
             cfg.out_dir + "/correlation_heatmap.png",
             last_result->best_azimuth_deg / cfg.az_step,
-            static_cast<int>(last_result->best_offset_m / (cfg.speed_mps * dt_s)));
+            static_cast<int>(last_result->best_offset_m / offset_step_m),
+            offset_step_m,
+            static_cast<float>(last_result->best_ncc));
     }
 
     if (!trajectory.empty()) {
+        double faz  = last_result ? last_result->best_azimuth_deg : -1.0;
+        double fdist = last_result ? last_result->best_offset_m   : 0.0;
         Visualizer::save_trajectory_on_dem(dem, trajectory,
                                            cfg.start_lat, cfg.start_lon,
                                            cfg.out_dir + "/trajectory.png",
-                                           cfg.jammer_zone);
+                                           cfg.jammer_zone,
+                                           faz, fdist, cfg.speed_mps);
     }
 
     if (trajectory.empty()) {
@@ -337,12 +380,311 @@ static int run_tercom(const Config& cfg, const DemData& dem,
     }
 
     auto& last = trajectory.back();
-    std::cerr << "\n=== РЕЗУЛЬТАТ (TERCOM) ===\n"
-              << "Найденная позиция: " << last.lat << "° N, " << last.lon << "° E\n"
-              << "Вектор скорости:   " << last.speed_mps << " м/с, "
+    int n_corr = static_cast<int>(trajectory.size());
+    double speed_kmh = last.speed_mps * 3.6;
+
+    // Расстояние от старта до последней точки через координаты
+    double dlat_km = (last.lat - cfg.start_lat) * 111.32;
+    double dlon_km = (last.lon - cfg.start_lon) * 111.32
+                   * std::cos(cfg.start_lat * M_PI / 180.0);
+    double total_dist_km = std::sqrt(dlat_km*dlat_km + dlon_km*dlon_km);
+
+    std::cerr << std::fixed << std::setprecision(6)
+              << "\n=== РЕЗУЛЬТАТ (TERCOM) ===\n"
+              << "Найденная позиция:  " << last.lat << "° N, " << last.lon << "° E\n";
+    if (last_result) {
+        std::cerr << std::fixed << std::setprecision(1)
+                  << "Путевой угол:       " << last_result->best_azimuth_deg << "°\n"
+                  << "Путевая скорость:   " << last.speed_mps << " м/с"
+                  << "  (" << speed_kmh << " км/ч)\n"
+                  << std::setprecision(4)
+                  << "NCC (качество):     " << last_result->best_ncc << "\n"
+                  << std::fixed << std::setprecision(2)
+                  << "Пройденное расст.:  " << total_dist_km << " км\n";
+    }
+    std::cerr << "Корреляций всего:   " << n_corr << "\n"
+              << "Файлы:              " << cfg.out_dir << "/\n";
+    return 0;
+}
+
+// ─────────────────── Ветка Line Navigator (хребты и впадины) ─────────────────
+
+static int run_line_navigator(const Config& cfg, const DemData& dem,
+                               const std::vector<NmeaFix>& fixes, double dt_s) {
+    std::cerr << "[LNAV] Вычисление карты хребтов/впадин (Hessian, NMS)...\n";
+    RidgeMap rm(dem, cfg.lnav_gauss, cfg.lnav_thresh);
+    std::cerr << "[LNAV] Карта готова: " << rm.size() << " точек\n";
+
+    std::vector<TrajectoryPoint> trajectory;
+    trajectory.reserve(fixes.size());
+
+    std::ofstream csv_out(cfg.out_dir + "/trn_estimate.csv");
+    csv_out << "timestamp_s,found_lat,found_lon,heading_deg,speed_mps,fix\n";
+
+    double last_gps_lat = cfg.start_lat, last_gps_lon = cfg.start_lon;
+    double last_gps_hdg = cfg.azimuth_deg;
+
+    std::unique_ptr<LineNavigator> lnav;
+    bool lnav_ready = false;
+
+    for (size_t fi = 0; fi < fixes.size(); ++fi) {
+        const auto& fix = fixes[fi];
+        bool gps_ok = (fix.gps_quality > 0);
+
+        TrajectoryPoint tp;
+        tp.gps_denied = !gps_ok;
+
+        if (gps_ok) {
+            tp.lat         = fix.lat;
+            tp.lon         = fix.lon;
+            tp.speed_mps   = cfg.speed_mps;
+            tp.heading_deg = last_gps_hdg;
+            tp.ncc         = 1.0;
+            if (fi > 0 && fixes[fi-1].gps_quality > 0) {
+                double dlat = fix.lat - fixes[fi-1].lat;
+                double dlon = (fix.lon - fixes[fi-1].lon)
+                              * std::cos(fix.lat * M_PI / 180.0);
+                if (std::abs(dlat) + std::abs(dlon) > 1e-9)
+                    last_gps_hdg = std::atan2(dlon, dlat) * 180.0 / M_PI;
+            }
+            last_gps_lat = fix.lat;
+            last_gps_lon = fix.lon;
+            lnav_ready   = false;
+        } else {
+            if (!lnav_ready) {
+                LNavConfig lcfg;
+                lcfg.elev_tol_m = static_cast<float>(cfg.cpf_sigma) * 2.0f;
+                lnav = std::make_unique<LineNavigator>(
+                        rm, last_gps_lat, last_gps_lon,
+                        last_gps_hdg, cfg.speed_mps, lcfg);
+                lnav_ready = true;
+            }
+            auto est = lnav->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
+                                  cfg.pf_hdg_noise, 1.0);
+            tp.lat         = est.lat;
+            tp.lon         = est.lon;
+            tp.heading_deg = est.heading_deg;
+            tp.speed_mps   = est.speed_mps;
+            tp.ncc         = est.fix_applied ? 1.0 : 0.5;
+        }
+        trajectory.push_back(tp);
+
+        csv_out << std::fixed << std::setprecision(6)
+                << fix.timestamp_s << ","
+                << tp.lat << "," << tp.lon << ","
+                << std::setprecision(2)
+                << tp.heading_deg << "," << tp.speed_mps << ","
+                << (tp.ncc > 0.9 ? 1 : 0) << "\n";
+    }
+    csv_out.close();
+
+    if (!trajectory.empty()) {
+        Visualizer::save_trajectory_on_dem(dem, trajectory,
+                                           cfg.start_lat, cfg.start_lon,
+                                           cfg.out_dir + "/trajectory.png",
+                                           cfg.jammer_zone);
+    }
+
+    auto& last = trajectory.back();
+    int total = lnav ? lnav->current().total_fixes : 0;
+    std::cerr << "\n=== РЕЗУЛЬТАТ (LNAV) ===\n"
+              << "Позиция:   " << last.lat << "° N, " << last.lon << "° E\n"
+              << "Вектор:    " << last.speed_mps << " м/с, "
               << last.heading_deg << "° (азимут)\n"
-              << "NCC (качество):    " << last.ncc << "\n"
-              << "Файлы сохранены в: " << cfg.out_dir << "/\n";
+              << "Всего fix: " << total << "\n"
+              << "Карта:     " << cfg.out_dir << "/trajectory.png\n";
+    return 0;
+}
+
+// ─────────────────── Ветка Contour PF (ключевые точки + изолинии) ────────────
+
+static int run_contour_pf(const Config& cfg, const DemData& dem,
+                           const std::vector<NmeaFix>& fixes, double dt_s) {
+    std::cerr << "[CPF] Загрузка ключевых точек рельефа (W=" << cfg.cpf_kp_window << ")...\n";
+    KeypointDB kpdb(dem, cfg.cpf_kp_window, 30.0f);
+    std::cerr << "[CPF] Запуск ContourPF: N=" << cfg.cpf_n
+              << " σ=" << cfg.cpf_sigma << " м"
+              << " az0=" << cfg.azimuth_deg << "°\n";
+
+    std::unique_ptr<ContourPF> cpf;
+
+    std::vector<TrajectoryPoint> trajectory;
+    trajectory.reserve(fixes.size());
+
+    std::ofstream csv_out(cfg.out_dir + "/trn_estimate.csv");
+    csv_out << "timestamp_s,found_lat,found_lon,heading_deg,speed_mps,neff\n";
+
+    double last_gps_lat = cfg.start_lat, last_gps_lon = cfg.start_lon;
+    double last_gps_hdg = cfg.azimuth_deg;
+    bool   cpf_ready    = false;
+
+    for (size_t fi = 0; fi < fixes.size(); ++fi) {
+        const auto& fix = fixes[fi];
+        bool gps_ok = (fix.gps_quality > 0);
+
+        TrajectoryPoint tp;
+        tp.gps_denied = !gps_ok;
+
+        if (gps_ok) {
+            tp.lat         = fix.lat;
+            tp.lon         = fix.lon;
+            tp.speed_mps   = cfg.speed_mps;
+            tp.heading_deg = last_gps_hdg;
+            tp.ncc         = 1.0;
+            if (fi > 0 && fixes[fi-1].gps_quality > 0) {
+                double dlat = fix.lat - fixes[fi-1].lat;
+                double dlon = (fix.lon - fixes[fi-1].lon)
+                              * std::cos(fix.lat * M_PI / 180.0);
+                if (std::abs(dlat) + std::abs(dlon) > 1e-9)
+                    last_gps_hdg = std::atan2(dlon, dlat) * 180.0 / M_PI;
+            }
+            last_gps_lat = fix.lat;
+            last_gps_lon = fix.lon;
+            cpf_ready    = false;
+        } else {
+            if (!cpf_ready) {
+                cpf = std::make_unique<ContourPF>(
+                        dem, kpdb,
+                        last_gps_lat, last_gps_lon,
+                        last_gps_hdg, cfg.speed_mps,
+                        cfg.cpf_n,
+                        /*pos_sigma_m=*/10.0,
+                        /*hdg_sigma_deg=*/5.0);
+                cpf_ready = true;
+            }
+            auto est = cpf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
+                                 cfg.pf_hdg_noise, 1.0, cfg.cpf_sigma);
+            tp.lat         = est.lat;
+            tp.lon         = est.lon;
+            tp.heading_deg = est.heading_deg;
+            tp.speed_mps   = est.speed_mps;
+            tp.ncc         = est.neff / cfg.cpf_n;
+        }
+        trajectory.push_back(tp);
+
+        csv_out << std::fixed << std::setprecision(6)
+                << fix.timestamp_s << ","
+                << tp.lat << "," << tp.lon << ","
+                << std::setprecision(2)
+                << tp.heading_deg << "," << tp.speed_mps << ","
+                << static_cast<int>(tp.ncc * cfg.cpf_n) << "\n";
+    }
+    csv_out.close();
+
+    if (!trajectory.empty()) {
+        Visualizer::save_trajectory_on_dem(dem, trajectory,
+                                           cfg.start_lat, cfg.start_lon,
+                                           cfg.out_dir + "/trajectory.png",
+                                           cfg.jammer_zone);
+    }
+
+    auto& last = trajectory.back();
+    std::cerr << "\n=== РЕЗУЛЬТАТ (CPF) ===\n"
+              << "Позиция:   " << last.lat << "° N, " << last.lon << "° E\n"
+              << "Вектор:    " << last.speed_mps << " м/с, "
+              << last.heading_deg << "° (азимут)\n"
+              << "Neff/N:    " << last.ncc << "\n"
+              << "CSV:       " << cfg.out_dir << "/trn_estimate.csv\n"
+              << "Траектория:" << cfg.out_dir << "/trajectory.png\n";
+    return 0;
+}
+
+// ─────────────────── Ветка Combined (CPF + RidgeMap ridge fixes) ─────────────
+
+static int run_combined(const Config& cfg, const DemData& dem,
+                         const std::vector<NmeaFix>& fixes, double dt_s) {
+    std::cerr << "[COMBINED] Построение RidgeMap (Hessian, gauss="
+              << cfg.lnav_gauss << ", thresh=" << cfg.lnav_thresh << ")...\n";
+    RidgeMap rm(dem, cfg.lnav_gauss, cfg.lnav_thresh);
+    std::cerr << "[COMBINED] RidgeMap готов: " << rm.size() << " точек\n";
+
+    std::cerr << "[COMBINED] Загрузка KeypointDB (W=" << cfg.cpf_kp_window << ")...\n";
+    KeypointDB kpdb(dem, cfg.cpf_kp_window, 30.0f);
+
+    std::cerr << "[COMBINED] ContourPF N=" << cfg.cpf_n
+              << " σ=" << cfg.cpf_sigma << " м (с ridge-fixes)\n";
+
+    std::unique_ptr<ContourPF> cpf;
+
+    std::vector<TrajectoryPoint> trajectory;
+    trajectory.reserve(fixes.size());
+
+    std::ofstream csv_out(cfg.out_dir + "/trn_estimate.csv");
+    csv_out << "timestamp_s,found_lat,found_lon,heading_deg,speed_mps,neff\n";
+
+    double last_gps_lat = cfg.start_lat, last_gps_lon = cfg.start_lon;
+    double last_gps_hdg = cfg.azimuth_deg;
+    bool   cpf_ready    = false;
+
+    for (size_t fi = 0; fi < fixes.size(); ++fi) {
+        const auto& fix = fixes[fi];
+        bool gps_ok = (fix.gps_quality > 0);
+
+        TrajectoryPoint tp;
+        tp.gps_denied = !gps_ok;
+
+        if (gps_ok) {
+            tp.lat         = fix.lat;
+            tp.lon         = fix.lon;
+            tp.speed_mps   = cfg.speed_mps;
+            tp.heading_deg = last_gps_hdg;
+            tp.ncc         = 1.0;
+            if (fi > 0 && fixes[fi-1].gps_quality > 0) {
+                double dlat = fix.lat - fixes[fi-1].lat;
+                double dlon = (fix.lon - fixes[fi-1].lon)
+                              * std::cos(fix.lat * M_PI / 180.0);
+                if (std::abs(dlat) + std::abs(dlon) > 1e-9)
+                    last_gps_hdg = std::atan2(dlon, dlat) * 180.0 / M_PI;
+            }
+            last_gps_lat = fix.lat;
+            last_gps_lon = fix.lon;
+            cpf_ready    = false;
+        } else {
+            if (!cpf_ready) {
+                cpf = std::make_unique<ContourPF>(
+                        dem, kpdb,
+                        last_gps_lat, last_gps_lon,
+                        last_gps_hdg, cfg.speed_mps,
+                        cfg.cpf_n,
+                        /*pos_sigma_m=*/10.0,
+                        /*hdg_sigma_deg=*/5.0,
+                        /*rm=*/&rm);
+                cpf_ready = true;
+            }
+            auto est = cpf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
+                                 cfg.pf_hdg_noise, 1.0, cfg.cpf_sigma);
+            tp.lat         = est.lat;
+            tp.lon         = est.lon;
+            tp.heading_deg = est.heading_deg;
+            tp.speed_mps   = est.speed_mps;
+            tp.ncc         = est.neff / cfg.cpf_n;
+        }
+        trajectory.push_back(tp);
+
+        csv_out << std::fixed << std::setprecision(6)
+                << fix.timestamp_s << ","
+                << tp.lat << "," << tp.lon << ","
+                << std::setprecision(2)
+                << tp.heading_deg << "," << tp.speed_mps << ","
+                << static_cast<int>(tp.ncc * cfg.cpf_n) << "\n";
+    }
+    csv_out.close();
+
+    if (!trajectory.empty()) {
+        Visualizer::save_trajectory_on_dem(dem, trajectory,
+                                           cfg.start_lat, cfg.start_lon,
+                                           cfg.out_dir + "/trajectory.png",
+                                           cfg.jammer_zone);
+    }
+
+    auto& last = trajectory.back();
+    std::cerr << "\n=== РЕЗУЛЬТАТ (COMBINED) ===\n"
+              << "Позиция:   " << last.lat << "° N, " << last.lon << "° E\n"
+              << "Вектор:    " << last.speed_mps << " м/с, "
+              << last.heading_deg << "° (азимут)\n"
+              << "Neff/N:    " << last.ncc << "\n"
+              << "CSV:       " << cfg.out_dir << "/trn_estimate.csv\n"
+              << "Траектория:" << cfg.out_dir << "/trajectory.png\n";
     return 0;
 }
 
@@ -376,7 +718,13 @@ int main(int argc, char** argv) {
     }
     std::cerr << "[MAIN] dt=" << dt_s << " с, " << fixes.size() << " измерений\n";
 
-    if (cfg.use_pf)
+    if (cfg.use_lnav)
+        return run_line_navigator(cfg, dem, fixes, dt_s);
+    else if (cfg.use_combined)
+        return run_combined(cfg, dem, fixes, dt_s);
+    else if (cfg.use_cpf)
+        return run_contour_pf(cfg, dem, fixes, dt_s);
+    else if (cfg.use_pf)
         return run_particle_filter(cfg, dem, fixes, dt_s);
     else
         return run_tercom(cfg, dem, fixes, dt_s);
