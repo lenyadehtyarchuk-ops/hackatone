@@ -125,7 +125,11 @@ static int run_particle_filter(const Config& cfg, const DemData& dem,
 
     double last_gps_lat = cfg.start_lat, last_gps_lon = cfg.start_lon;
     double last_gps_hdg = cfg.azimuth_deg;
-    bool   pf_ready     = false;  // PF инициализирован из GPS-точки
+    bool   pf_ready     = false;
+
+    // Кольцевой буфер последних win AGL-измерений, курсов и скоростей из GPS-фазы
+    std::deque<double> gps_agl_buf, gps_hdg_buf, gps_spd_buf;
+    const int win = cfg.min_profile;
 
     for (size_t fi = 0; fi < fixes.size(); ++fi) {
         const auto& fix = fixes[fi];
@@ -136,11 +140,11 @@ static int run_particle_filter(const Config& cfg, const DemData& dem,
 
         if (gps_ok) {
             // GPS доступен — берём координаты напрямую
-            tp.lat        = fix.lat;
-            tp.lon        = fix.lon;
-            tp.speed_mps  = cfg.speed_mps;
+            tp.lat         = fix.lat;
+            tp.lon         = fix.lon;
+            tp.speed_mps   = cfg.speed_mps;
             tp.heading_deg = last_gps_hdg;
-            tp.ncc        = 1.0;
+            tp.ncc         = 1.0;
             // Вычислить heading из двух последних GPS-точек
             if (fi > 0 && fixes[fi-1].gps_quality > 0) {
                 double dlat = fix.lat - fixes[fi-1].lat;
@@ -151,18 +155,27 @@ static int run_particle_filter(const Config& cfg, const DemData& dem,
             }
             last_gps_lat = fix.lat;
             last_gps_lon = fix.lon;
-            pf_ready = false;  // PF нужно переинициализировать при следующем GPS→denied
+            pf_ready = false;
+
+            // Накапливаем AGL, курс и скорость для предзаполнения PF
+            gps_agl_buf.push_back(fix.radio_alt_m);
+            gps_hdg_buf.push_front(last_gps_hdg);
+            gps_spd_buf.push_front(cfg.speed_mps);  // [0]=последний, как в spd_history
+            if ((int)gps_agl_buf.size() > win) gps_agl_buf.pop_front();
+            if ((int)gps_hdg_buf.size() > win) gps_hdg_buf.pop_back();
+            if ((int)gps_spd_buf.size() > win) gps_spd_buf.pop_back();
         } else {
             // GPS отсутствует — используем PF
             if (!pf_ready) {
-                // Первый шаг без GPS: инициализируем PF из последней GPS-точки
                 pf = std::make_unique<ParticleFilter>(
                         dem, last_gps_lat, last_gps_lon,
                         last_gps_hdg, cfg.speed_mps,
                         cfg.pf_n,
-                        /*profile_win=*/cfg.min_profile,
-                        /*pos_sigma_m=*/10.0,   // знаем позицию точно
-                        /*hdg_sigma_deg=*/5.0); // знаем курс примерно
+                        /*profile_win=*/win,
+                        /*pos_sigma_m=*/10.0,
+                        /*hdg_sigma_deg=*/5.0);
+                // Предзаполнить буфер реальными GPS-данными — холодный старт устранён
+                pf->prefill(gps_agl_buf, gps_hdg_buf, gps_spd_buf);
                 pf_ready = true;
             }
             PFEstimate est = pf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,

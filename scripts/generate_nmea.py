@@ -117,6 +117,10 @@ def main():
     parser.add_argument("--seed",         type=int,   default=42,    help="Зерно генератора")
     parser.add_argument("--sin-exp-amplitude", type=float, default=0.0,
                         help="Амплитуда формы sin(x)+0.1e^x (м боковое отклонение). 0=выкл")
+    parser.add_argument("--sine-amplitude", type=float, default=0.0,
+                        help="Амплитуда чистой синусоиды (м боковое отклонение). 0=выкл")
+    parser.add_argument("--sine-cycles",   type=float, default=2.0,
+                        help="Число полных циклов синусоиды за маршрут (default=2)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -191,13 +195,21 @@ def main():
         dist_step = speed * step_s
 
         # Обновить курс
-        if args.sin_exp_amplitude > 0:
-            # Предписанный курс из производной sin(x)+0.1*e^x
-            # x пробегает [-1.5, 4.0] по мере продвижения маршрута
+        if args.sine_amplitude > 0:
+            # Чистая синусоида: lateral(i) = A*sin(2π*cycles*i/(n-1))
+            # lateral_m — боковое смещение за один шаг (м)
+            t_norm = i / max(n_steps - 1, 1)  # 0..1
+            phase = 2.0 * math.pi * args.sine_cycles * t_norm
+            lateral_m = (args.sine_amplitude * 2.0 * math.pi * args.sine_cycles
+                         / max(n_steps - 1, 1) * math.cos(phase))
+            heading = args.azimuth + math.degrees(math.atan2(lateral_m, dist_step))
+            if args.heading_sigma > 0:
+                heading += random.gauss(0, args.heading_sigma)
+        elif args.sin_exp_amplitude > 0:
             x_i = -1.5 + 5.5 * (i / max(n_steps - 1, 1))
             dydx = math.cos(x_i) + 0.1 * math.exp(x_i)
             dx_per_step = 5.5 / max(n_steps - 1, 1)
-            lateral_m = args.sin_exp_amplitude * dydx * dx_per_step  # м/шаг вбок
+            lateral_m = args.sin_exp_amplitude * dydx * dx_per_step
             heading = args.azimuth + math.degrees(math.atan2(lateral_m, dist_step))
             if args.heading_sigma > 0:
                 heading += random.gauss(0, args.heading_sigma)

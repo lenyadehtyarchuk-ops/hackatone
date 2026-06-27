@@ -7,6 +7,7 @@
 struct Particle {
     double lat, lon, heading_deg, speed_mps, weight;
     std::deque<double> hdg_history;  // [0]=курс на последнем шаге, [1]=предпоследнем, ...
+    std::deque<double> spd_history;  // [0]=скорость на последнем шаге, [1]=предпоследнем, ...
 };
 
 struct PFEstimate {
@@ -38,6 +39,12 @@ public:
                     double hdg_noise_deg = 3.0,
                     double spd_noise_mps = 1.0,
                     double meas_sigma_m  = 3.0);
+
+    // Предзаполнить буфер AGL и историю курсов из GPS-фазы.
+    // Вызывать сразу после создания PF, до первого step().
+    void prefill(const std::deque<double>& agl_hist,
+                 const std::deque<double>& hdg_hist,
+                 const std::deque<double>& spd_hist);
 
     PFEstimate estimate() const;
     int n() const { return n_; }

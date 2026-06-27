@@ -30,7 +30,6 @@ ParticleFilter::ParticleFilter(const DemData& dem,
     std::normal_distribution<double> pos_d(0.0, pos_sigma_m);
     std::normal_distribution<double> hdg_d(heading_deg, hdg_sigma_deg);
     std::normal_distribution<double> spd_d(speed_mps, 3.0);
-
     double cos_lat = std::cos(start_lat * DEG2RAD);
     double uw      = 1.0 / n_particles;
 
@@ -40,6 +39,20 @@ ParticleFilter::ParticleFilter(const DemData& dem,
         pt.heading_deg = std::fmod(hdg_d(rng_) + 360.0, 360.0);
         pt.speed_mps   = std::max(5.0, spd_d(rng_));
         pt.weight      = uw;
+    }
+}
+
+void ParticleFilter::prefill(const std::deque<double>& agl_hist,
+                             const std::deque<double>& hdg_hist,
+                             const std::deque<double>& spd_hist) {
+    agl_buf_ = agl_hist;
+    while ((int)agl_buf_.size() > win_) agl_buf_.pop_front();
+
+    for (auto& pt : p_) {
+        pt.hdg_history = hdg_hist;
+        while ((int)pt.hdg_history.size() > win_) pt.hdg_history.pop_back();
+        pt.spd_history = spd_hist;
+        while ((int)pt.spd_history.size() > win_) pt.spd_history.pop_back();
     }
 }
 
@@ -54,12 +67,14 @@ void ParticleFilter::predict(double dt_s,
         move_latlon(pt.lat, pt.lon, pt.heading_deg, pt.speed_mps * dt_s,
                     pt.lat, pt.lon);
         pt.hdg_history.push_front(pt.heading_deg);
-        if ((int)pt.hdg_history.size() > win_)
-            pt.hdg_history.pop_back();
+        if ((int)pt.hdg_history.size() > win_) pt.hdg_history.pop_back();
+        pt.spd_history.push_front(pt.speed_mps);
+        if ((int)pt.spd_history.size() > win_) pt.spd_history.pop_back();
     }
 }
 
 // NCC между двумя профилями длины K (инвариантна к постоянному смещению)
+// Используется и для h[], и для ∇h[]
 static double ncc_profiles(const double* meas, const double* ref, int K) {
     double mm = 0.0, mr = 0.0;
     for (int k = 0; k < K; ++k) { mm += meas[k]; mr += ref[k]; }
@@ -87,45 +102,58 @@ void ParticleFilter::profile_update(double baro_alt_m,
     double sm = 0.0;
     for (int k = 0; k < K; ++k) sm += (agl_buf_[k]-mm)*(agl_buf_[k]-mm);
     double profile_std = std::sqrt(sm / K);
-    if (profile_std < 5.0) return;  // рельеф слишком плоский
+    if (profile_std < 5.0) return;
 
-    // Измеренный профиль: agl_buf_[K-1] = текущая позиция (k=0)
+    // Измеренный профиль высот: agl_buf_[K-1] = текущая позиция (k=0)
     std::vector<double> meas(K);
     for (int k = 0; k < K; ++k) meas[k] = agl_buf_[K - 1 - k];
 
+    // Градиентный профиль измерений ∇h[k] = meas[k] - meas[k+1]
+    std::vector<double> meas_grad(K - 1);
+    for (int k = 0; k < K - 1; ++k) meas_grad[k] = meas[k] - meas[k + 1];
+
     std::vector<double> ref(K);
+    std::vector<double> ref_grad(K - 1);
     double total_w = 0.0;
-    constexpr double LAMBDA = 5.0;
+    constexpr double LAMBDA      = 5.0;
+    constexpr double GRAD_WEIGHT = 0.4;
 
     for (auto& pt : p_) {
-        double step_m = pt.speed_mps * dt_s;
-        bool valid = true;
-
-        // k=0: текущая позиция
         double plat = pt.lat, plon = pt.lon;
         float h = DemLoader::sample(dem_, plat, plon, -9999.0f);
         if (h < -9000.0f) { pt.weight = 0.0; continue; }
         ref[0] = baro_alt_m - static_cast<double>(h);
 
-        // k=1..K-1: идём назад по реальным курсам частицы (не прямая!)
+        constexpr int N_SUB = 2;
+        bool valid = true;
         for (int k = 1; k < K; ++k) {
-            // курс которым летели ДО текущей позиции на k шагов назад
             double hdg_k = (k - 1 < (int)pt.hdg_history.size())
-                           ? pt.hdg_history[k - 1]
-                           : pt.heading_deg;  // fallback если истории мало
-            double az_b = std::fmod(hdg_k + 180.0, 360.0) * DEG2RAD;
-            double cos_lat = std::cos(plat * DEG2RAD);
-            plat += step_m * std::cos(az_b) / 111320.0;
-            plon += step_m * std::sin(az_b) / (111320.0 * cos_lat);
-            h = DemLoader::sample(dem_, plat, plon, -9999.0f);
-            if (h < -9000.0f) { valid = false; break; }
-            ref[k] = baro_alt_m - static_cast<double>(h);
+                           ? pt.hdg_history[k - 1] : pt.heading_deg;
+            double spd_k = (k - 1 < (int)pt.spd_history.size())
+                           ? pt.spd_history[k - 1] : pt.speed_mps;
+            double az_b  = std::fmod(hdg_k + 180.0, 360.0) * DEG2RAD;
+            double sub_m = (spd_k * dt_s) / N_SUB;
+            double h_sum = 0.0;
+            bool h_valid = true;
+            for (int s = 0; s < N_SUB; ++s) {
+                double cos_lat = std::cos(plat * DEG2RAD);
+                plat += sub_m * std::cos(az_b) / 111320.0;
+                plon += sub_m * std::sin(az_b) / (111320.0 * cos_lat);
+                float hs = DemLoader::sample(dem_, plat, plon, -9999.0f);
+                if (hs < -9000.0f) { h_valid = false; break; }
+                h_sum += static_cast<double>(hs);
+            }
+            if (!h_valid) { valid = false; break; }
+            ref[k] = baro_alt_m - h_sum / N_SUB;
         }
-
         if (!valid) { pt.weight = 0.0; continue; }
 
-        double ncc = ncc_profiles(meas.data(), ref.data(), K);
-        // NCC ∈ [-1,1]: вес = exp(λ·ncc); плохие профили (ncc<0) → малый вес
+        for (int k = 0; k < K - 1; ++k) ref_grad[k] = ref[k] - ref[k + 1];
+
+        double ncc_h = ncc_profiles(meas.data(),      ref.data(),      K);
+        double ncc_g = ncc_profiles(meas_grad.data(), ref_grad.data(), K - 1);
+        double ncc   = (1.0 - GRAD_WEIGHT) * ncc_h + GRAD_WEIGHT * ncc_g;
+
         pt.weight *= std::exp(LAMBDA * ncc);
         total_w   += pt.weight;
     }
