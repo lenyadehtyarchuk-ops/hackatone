@@ -233,26 +233,55 @@ def main():
         draw.rectangle([ex-8,  ey-8,  ex+8,  ey+8 ], fill=(220, 80, 30))
         draw_label(draw, ex + 14, ey - 10, "End", (255, 180, 80))
 
+    def draw_arrow(d, x1, y1, x2, y2, color, width=3, head_len=22, head_angle=28):
+        """Рисует стрелку от (x1,y1) до (x2,y2)."""
+        import math as _m
+        d.line([(x1, y1), (x2, y2)], fill=color, width=width)
+        angle = _m.atan2(y2 - y1, x2 - x1)
+        for side in (+1, -1):
+            wing_angle = angle + _m.pi - side * _m.radians(head_angle)
+            wx = int(x2 + head_len * _m.cos(wing_angle))
+            wy = int(y2 + head_len * _m.sin(wing_angle))
+            d.line([(x2, y2), (wx, wy)], fill=color, width=width)
+
     # --- TRN estimated track ---
     if args.trn and os.path.exists(args.trn):
         trn_rows = []
         with open(args.trn, newline="") as f:
             for row in csv.DictReader(f):
-                trn_rows.append((float(row["found_lat"]), float(row["found_lon"])))
+                trn_rows.append({
+                    "lat": float(row["found_lat"]),
+                    "lon": float(row["found_lon"]),
+                    "hdg": float(row.get("heading_deg", -1)),
+                    "spd": float(row.get("speed_mps", 0)),
+                })
         if trn_rows:
             # Линия от старта GT до первого TRN фикса (период накопления)
             start_px = latlon_to_pixel(gt_rows[0][0], gt_rows[0][1], args.zoom, x_min_t, y_min_t, TILE)
-            first_trn_px = latlon_to_pixel(trn_rows[0][0], trn_rows[0][1], args.zoom, x_min_t, y_min_t, TILE)
+            first_trn_px = latlon_to_pixel(trn_rows[0]["lat"], trn_rows[0]["lon"], args.zoom, x_min_t, y_min_t, TILE)
             draw.line([start_px, first_trn_px], fill=(80, 80, 255), width=5)
             draw.line([start_px, first_trn_px], fill=(120, 180, 255), width=3)
             # Соединяем TRN фиксы
             trn_pts = [first_trn_px] + [
-                latlon_to_pixel(lat, lon, args.zoom, x_min_t, y_min_t, TILE)
-                for lat, lon in trn_rows[1:]
+                latlon_to_pixel(r["lat"], r["lon"], args.zoom, x_min_t, y_min_t, TILE)
+                for r in trn_rows[1:]
             ]
             for i in range(1, len(trn_pts)):
                 draw.line([trn_pts[i-1], trn_pts[i]], fill=(80, 80, 255), width=5)
                 draw.line([trn_pts[i-1], trn_pts[i]], fill=(120, 180, 255), width=3)
+
+            # Подпись az/v рядом со стартом
+            last = trn_rows[-1]
+            spd = last["spd"]
+            dlat = trn_rows[-1]["lat"] - gt_rows[0][0]
+            dlon = (trn_rows[-1]["lon"] - gt_rows[0][1]) * math.cos(math.radians(gt_rows[0][0]))
+            mean_az = math.degrees(math.atan2(dlon, dlat)) % 360
+            label = f"az={mean_az:.0f}°  v={spd:.0f} m/s"
+            kw = {"font": font_label} if font_label else {}
+            sx, sy = start_px
+            draw.text((sx + 14, sy + 14), label, fill=(0, 0, 0), **kw)
+            draw.text((sx + 13, sy + 13), label, fill=(60, 220, 255), **kw)
+
             # Финиш TRN
             ex, ey = trn_pts[-1]
             draw.rectangle([ex-8, ey-8, ex+8, ey+8], fill=(255,255,255))

@@ -286,7 +286,7 @@ static int run_tercom(const Config& cfg, const DemData& dem,
     double ref_lon = cfg.start_lon;
 
     std::ofstream csv_out(cfg.out_dir + "/trn_estimate.csv");
-    csv_out << "timestamp_s,found_lat,found_lon,kf_x_m,kf_y_m,"
+    csv_out << "timestamp_s,found_lat,found_lon,x_m,y_m,"
                "speed_mps,heading_deg,ncc\n";
 
     for (size_t i = 0; i < fixes.size(); ++i) {
@@ -631,7 +631,7 @@ static int run_combined(const Config& cfg, const DemData& dem,
     trajectory.reserve(fixes.size());
 
     std::ofstream csv_out(cfg.out_dir + "/trn_estimate.csv");
-    csv_out << "timestamp_s,found_lat,found_lon,heading_deg,speed_mps,neff\n";
+    csv_out << "timestamp_s,found_lat,found_lon,x_m,y_m,heading_deg,speed_mps,neff\n";
 
     double last_gps_lat = cfg.start_lat, last_gps_lon = cfg.start_lon;
     double last_gps_hdg = cfg.azimuth_deg;
@@ -761,30 +761,62 @@ static int run_combined(const Config& cfg, const DemData& dem,
         }
         trajectory.push_back(tp);
 
-        csv_out << std::fixed << std::setprecision(6)
-                << fix.timestamp_s << ","
-                << tp.lat << "," << tp.lon << ","
-                << std::setprecision(2)
-                << tp.heading_deg << "," << tp.speed_mps << ","
-                << static_cast<int>(tp.ncc * cfg.cpf_n) << "\n";
+        {
+            double cos_lat = std::cos(cfg.start_lat * M_PI / 180.0);
+            double x_m = (tp.lon - cfg.start_lon) * 111320.0 * cos_lat;
+            double y_m = (tp.lat - cfg.start_lat) * 111320.0;
+            csv_out << std::fixed << std::setprecision(6)
+                    << fix.timestamp_s << ","
+                    << tp.lat << "," << tp.lon << ","
+                    << std::setprecision(2)
+                    << x_m << "," << y_m << ","
+                    << tp.heading_deg << "," << tp.speed_mps << ","
+                    << static_cast<int>(tp.ncc * cfg.cpf_n) << "\n";
+        }
     }
     csv_out.close();
+
+    // Средняя скорость и среднее направление (start→end)
+    double mean_speed = 0.0; int n_denied = 0;
+    for (auto& pt : trajectory) {
+        if (pt.gps_denied) { mean_speed += pt.speed_mps; n_denied++; }
+    }
+    if (n_denied > 0) mean_speed /= n_denied;
+
+    auto& last = trajectory.back();
+    double cos_lat = std::cos(cfg.start_lat * M_PI / 180.0);
+    double end_x_m = (last.lon - cfg.start_lon) * 111320.0 * cos_lat;
+    double end_y_m = (last.lat - cfg.start_lat) * 111320.0;
+    double dist_m  = std::sqrt(end_x_m * end_x_m + end_y_m * end_y_m);
+    double mean_hdg = std::atan2(end_x_m, end_y_m) * 180.0 / M_PI;
+    if (mean_hdg < 0) mean_hdg += 360.0;
 
     if (!trajectory.empty()) {
         Visualizer::save_trajectory_on_dem(dem, trajectory,
                                            cfg.start_lat, cfg.start_lon,
                                            cfg.out_dir + "/trajectory.png",
-                                           cfg.jammer_zone);
+                                           cfg.jammer_zone,
+                                           mean_hdg, 0.0,
+                                           n_denied > 0 ? mean_speed : cfg.speed_mps);
     }
 
-    auto& last = trajectory.back();
     std::cerr << "\n=== РЕЗУЛЬТАТ (COMBINED) ===\n"
               << "Позиция:   " << last.lat << "° N, " << last.lon << "° E\n"
               << "Вектор:    " << last.speed_mps << " м/с, "
               << last.heading_deg << "° (азимут)\n"
               << "Neff/N:    " << last.ncc << "\n"
               << "CSV:       " << cfg.out_dir << "/trn_estimate.csv\n"
-              << "Траектория:" << cfg.out_dir << "/trajectory.png\n";
+              << "Траектория:" << cfg.out_dir << "/trajectory.png\n"
+              << "\n=== ИТОГ ===\n"
+              << "Старт:    lat=" << cfg.start_lat << " lon=" << cfg.start_lon
+              << "  (x=0 м, y=0 м)\n"
+              << "Финиш:    lat=" << last.lat << " lon=" << last.lon
+              << std::fixed << std::setprecision(1)
+              << "  (x=" << end_x_m << " м, y=" << end_y_m << " м)\n"
+              << "Пройдено:  " << dist_m << " м\n"
+              << "Скорость:  " << (n_denied > 0 ? mean_speed : cfg.speed_mps)
+              << " м/с (оценка PF)\n"
+              << "Азимут:    " << mean_hdg << "°\n";
     return 0;
 }
 
@@ -817,6 +849,18 @@ int main(int argc, char** argv) {
         if (total_t > 0) dt_s = total_t / (fixes.size() - 1);
     }
     std::cerr << "[MAIN] dt=" << dt_s << " с, " << fixes.size() << " измерений\n";
+
+    if (cfg.baro_alt_m < 0.0) {
+        float dem_h = DemLoader::sample(dem, cfg.start_lat, cfg.start_lon, -9999.f);
+        if (!fixes.empty() && dem_h > -9000.f) {
+            cfg.baro_alt_m = dem_h + fixes.front().radio_alt_m;
+            std::cerr << "[MAIN] baro авто: DEM(" << dem_h << ") + AGL("
+                      << fixes.front().radio_alt_m << ") = " << cfg.baro_alt_m << " м\n";
+        } else {
+            std::cerr << "ERROR: --baro не задан и DEM в стартовой точке пустой\n";
+            return 1;
+        }
+    }
 
     if (cfg.use_lnav)
         return run_line_navigator(cfg, dem, fixes, dt_s);

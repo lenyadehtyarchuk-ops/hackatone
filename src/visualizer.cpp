@@ -300,6 +300,15 @@ void Visualizer::save_trajectory_on_dem(const DemData& dem,
                 cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,0,0),   3);
     cv::putText(vis, "Start", sp + cv::Point(13, 4),
                 cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(40,220,40), 1);
+    if (found_az_deg >= 0.0 && found_speed_mps > 0.0) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "az=%.0fdeg  v=%.0f m/s",
+                      found_az_deg, found_speed_mps);
+        cv::putText(vis, buf, sp + cv::Point(13, 22),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.50, cv::Scalar(0,0,0), 3, cv::LINE_AA);
+        cv::putText(vis, buf, sp + cv::Point(13, 22),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.50, cv::Scalar(60, 220, 255), 1, cv::LINE_AA);
+    }
     if (!pts.empty()) {
         cv::putText(vis, "End", pts.back() + cv::Point(13, 4),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,0,0),   3);

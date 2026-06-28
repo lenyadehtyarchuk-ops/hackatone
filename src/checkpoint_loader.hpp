@@ -5,7 +5,7 @@ struct CheckpointManifest {
     std::string dem_path;
     std::string nmea_path;
     std::string out_dir;
-    double baro_alt_m   = 1500.0;
+    double baro_alt_m   = -1.0;   // -1 = не задан → автооценка
     double start_lat    = 0.0;
     double start_lon    = 0.0;
     double speed_mps    = 40.0;
