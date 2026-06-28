@@ -637,6 +637,12 @@ static int run_combined(const Config& cfg, const DemData& dem,
     double last_gps_hdg = cfg.azimuth_deg;
     bool   cpf_ready    = false;
 
+    std::deque<double> gps_hdg_history;
+    constexpr int HDG_WIN = 10;
+
+    double active_cpf_sigma = cfg.cpf_sigma;
+    double active_hdg_noise = cfg.pf_hdg_noise;
+
     for (size_t fi = 0; fi < fixes.size(); ++fi) {
         const auto& fix = fixes[fi];
         bool gps_ok = (fix.gps_quality > 0);
@@ -657,23 +663,78 @@ static int run_combined(const Config& cfg, const DemData& dem,
                 if (std::abs(dlat) + std::abs(dlon) > 1e-9)
                     last_gps_hdg = std::atan2(dlon, dlat) * 180.0 / M_PI;
             }
+            gps_hdg_history.push_back(last_gps_hdg);
+            if ((int)gps_hdg_history.size() > HDG_WIN) gps_hdg_history.pop_front();
             last_gps_lat = fix.lat;
             last_gps_lon = fix.lon;
             cpf_ready    = false;
         } else {
             if (!cpf_ready) {
+                // Compute yaw_rate from GPS heading history
+                double yaw_rate = 0.0;
+                int nh = (int)gps_hdg_history.size();
+                if (nh >= 2) {
+                    double sum_dhdg = 0;
+                    for (int k = 1; k < nh; k++) {
+                        double d = gps_hdg_history[k] - gps_hdg_history[k-1];
+                        while (d >  180) d -= 360;
+                        while (d < -180) d += 360;
+                        sum_dhdg += d;
+                    }
+                    yaw_rate = sum_dhdg / ((nh - 1) * dt_s);
+                }
+
+                // Detect flat terrain by sampling DEM roughness around entry point.
+                // Variance of pre-jammer AGL readings is unreliable (slow approach
+                // to mountains also looks flat). DEM sampling is ground truth.
+                double local_sigma = 0.0;
+                {
+                    double dlat = 3000.0 / 111320.0;
+                    double cos_l = std::cos(last_gps_lat * M_PI / 180.0);
+                    double dlon  = 3000.0 / (111320.0 * cos_l);
+                    constexpr int S = 8;
+                    double sum = 0, sum2 = 0;
+                    int cnt = 0;
+                    for (int i = -S; i <= S; i++) {
+                        for (int j = -S; j <= S; j++) {
+                            float h = DemLoader::sample(dem,
+                                (float)(last_gps_lat + i * dlat / S),
+                                (float)(last_gps_lon + j * dlon / S), -9999.0f);
+                            if (h > -9000.0f) { sum += h; sum2 += h * h; cnt++; }
+                        }
+                    }
+                    if (cnt > 4) {
+                        double m = sum / cnt;
+                        local_sigma = std::sqrt(std::max(0.0, sum2 / cnt - m * m));
+                    }
+                }
+
+                constexpr double FLAT_THRESH = 50.0;  // m RMS
+                bool flat = (local_sigma < FLAT_THRESH);
+
+                double eff_hdg_sigma = flat ? 2.0  : 5.0;
+                double eff_yaw_sigma = flat ? 0.02 : 0.2;
+                active_cpf_sigma     = flat ? 50.0 : cfg.cpf_sigma;
+                active_hdg_noise     = flat ? 0.3  : cfg.pf_hdg_noise;
+
+                std::cerr << "[COMBINED] local_sigma=" << local_sigma
+                          << (flat ? " → FLAT (guided DR)" : " → MOUNTAIN")
+                          << " yaw_rate=" << yaw_rate << "°/s\n";
+
                 cpf = std::make_unique<ContourPF>(
                         dem, kpdb,
                         last_gps_lat, last_gps_lon,
                         last_gps_hdg, cfg.speed_mps,
                         cfg.cpf_n,
-                        /*pos_sigma_m=*/10.0,
-                        /*hdg_sigma_deg=*/5.0,
-                        /*rm=*/&rm);
+                        /*pos_sigma_m=*/   10.0,
+                        /*hdg_sigma_deg=*/ eff_hdg_sigma,
+                        /*rm=*/            &rm,
+                        /*yaw_rate_dps=*/  yaw_rate,
+                        /*yaw_sigma_dps=*/ eff_yaw_sigma);
                 cpf_ready = true;
             }
             auto est = cpf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
-                                 cfg.pf_hdg_noise, 1.0, cfg.cpf_sigma);
+                                 active_hdg_noise, 1.0, active_cpf_sigma);
             tp.lat         = est.lat;
             tp.lon         = est.lon;
             tp.heading_deg = est.heading_deg;
