@@ -18,6 +18,7 @@ find_package(OpenMP)
 
 add_executable(trn
     src/main.cpp
+    src/checkpoint_loader.cpp
     src/nmea_parser.cpp
     src/dem_loader.cpp
     src/terrain_correlator.cpp

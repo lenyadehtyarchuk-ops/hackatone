@@ -1,0 +1,6 @@
+# UI: venv + pip (Streamlit нет в apt для Python 3.14)
+#   ./run_ui.sh          — веб-UI (Streamlit)
+#   ./run_viewer_tk.sh   — десктоп (Tkinter, только apt)
+streamlit>=1.28
+numpy
+opencv-python-headless

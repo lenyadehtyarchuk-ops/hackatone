@@ -1,5 +1,8 @@
 build/
 data/dem/
+test_source/map_full.tif
+test_source/output/flight.nmea
+test_source/output/*.png
 data/nmea/steppe_flight.nmea
 data/nmea/elbrus_noise2.nmea
 data/nmea/elbrus_noise2_gt.csv

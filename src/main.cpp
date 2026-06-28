@@ -19,6 +19,7 @@
 #include "ridge_map.hpp"
 #include "line_navigator.hpp"
 #include "visualizer.hpp"
+#include "checkpoint_loader.hpp"
 
 namespace fs = std::filesystem;
 
@@ -49,7 +50,21 @@ struct Config {
     float       lnav_gauss      = 3.0f; // Gaussian sigma для Hessian (пикселей)
     float       lnav_thresh     = 0.03f;// порог кривизны (доля от максимума)
     std::vector<double> jammer_zone;
+    std::string source_dir;
 };
+
+static void apply_checkpoint(const CheckpointManifest& m, Config& cfg) {
+    cfg.dem_path        = m.dem_path;
+    cfg.nmea_path       = m.nmea_path;
+    cfg.out_dir         = m.out_dir;
+    cfg.baro_alt_m      = m.baro_alt_m;
+    cfg.start_lat       = m.start_lat;
+    cfg.start_lon       = m.start_lon;
+    cfg.speed_mps       = m.speed_mps;
+    cfg.azimuth_deg     = m.azimuth_deg;
+    cfg.search_radius_m = m.search_radius_m;
+    cfg.min_profile     = m.min_profile;
+}
 
 static void print_usage(const char* prog) {
     std::cerr << "Использование:\n"
@@ -58,6 +73,7 @@ static void print_usage(const char* prog) {
               << "               [--speed 80] [--azimuth 120]\n"
               << "               [--radius 20000] [--min-profile 40]\n"
               << "               [--az-step 1] [--out results/] [--gui] [--sliding]\n"
+              << "               [--source test_source]  # формат 3-го чекпоинта\n"
               << "               [--pf] [--pf-n 1000] [--pf-hdg-noise 8] [--pf-meas-sigma 4]\n";
 }
 
@@ -105,10 +121,15 @@ static Config parse_args(int argc, char** argv) {
                 std::exit(1);
             }
         }
+        else if (a == "--source")       cfg.source_dir      = next();
         else if (a == "--help" || a == "-h") { print_usage(argv[0]); std::exit(0); }
         else { std::cerr << "Unknown arg: " << a << "\n"; print_usage(argv[0]); std::exit(1); }
     }
-    if (cfg.dem_path.empty() || cfg.nmea_path.empty()) {
+    if (!cfg.source_dir.empty()) {
+        CheckpointManifest m;
+        if (!load_checkpoint_source(cfg.source_dir, m)) std::exit(1);
+        apply_checkpoint(m, cfg);
+    } else if (cfg.dem_path.empty() || cfg.nmea_path.empty()) {
         print_usage(argv[0]);
         std::exit(1);
     }
