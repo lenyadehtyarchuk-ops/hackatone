@@ -643,6 +643,10 @@ static int run_combined(const Config& cfg, const DemData& dem,
     double active_cpf_sigma = cfg.cpf_sigma;
     double active_hdg_noise = cfg.pf_hdg_noise;
 
+    // Dead-reckoning state for flat-terrain fallback
+    double dr_lat = 0.0, dr_lon = 0.0, dr_hdg = 0.0, dr_speed = 0.0;
+    double dr_yaw_rate = 0.0;  // °/s from GPS history — kept fixed once set
+
     for (size_t fi = 0; fi < fixes.size(); ++fi) {
         const auto& fix = fixes[fi];
         bool gps_ok = (fix.gps_quality > 0);
@@ -683,6 +687,7 @@ static int run_combined(const Config& cfg, const DemData& dem,
                     }
                     yaw_rate = sum_dhdg / ((nh - 1) * dt_s);
                 }
+                dr_yaw_rate = yaw_rate;
 
                 // Detect flat terrain by sampling DEM roughness around entry point.
                 // Variance of pre-jammer AGL readings is unreliable (slow approach
@@ -736,20 +741,70 @@ static int run_combined(const Config& cfg, const DemData& dem,
             auto est = cpf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
                                  active_hdg_noise, 1.0, active_cpf_sigma);
 
-            // In flat terrain mode apply EMA using the accumulated estimated track:
-            // each output position is a blend of the current PF estimate and the
-            // previous smoothed position, so the already-guessed trajectory
-            // stabilises future outputs rather than letting PF noise accumulate.
-            if (active_cpf_sigma > cfg.cpf_sigma) {  // flat mode flag
-                constexpr double EMA_ALPHA = 0.45;
+            if (active_cpf_sigma > cfg.cpf_sigma) {
+                // Flat terrain: Neff-weighted PF/DR blend + step-consistency filter.
+                double neff_ratio = std::min(1.0, est.neff / cfg.cpf_n);
+
                 if (trajectory.empty() || !trajectory.back().gps_denied) {
-                    // First denied step — seed smoother at last GPS fix
-                    tp.lat = est.lat;
-                    tp.lon = est.lon;
-                } else {
+                    // Seed DR from last GPS fix
+                    dr_lat   = last_gps_lat;
+                    dr_lon   = last_gps_lon;
+                    dr_hdg   = last_gps_hdg;
+                    dr_speed = (est.speed_mps > 1.0) ? est.speed_mps : cfg.speed_mps;
+                }
+
+                // Advance DR heading: base from GPS yaw_rate + weak PF correction (α=0.1).
+                // Pure GPS anchor prevents PF from dragging the course off; small PF
+                // blend lets the DR gradually follow real curvature and keeps the step
+                // filter from rejecting valid corrections near the end of the zone.
+                {
+                    double base_hdg = dr_hdg + dr_yaw_rate * dt_s;
+                    double pf_diff  = est.heading_deg - base_hdg;
+                    while (pf_diff >  180.0) pf_diff -= 360.0;
+                    while (pf_diff < -180.0) pf_diff += 360.0;
+                    constexpr double PF_HDG_ALPHA = 0.3;
+                    dr_hdg = base_hdg + PF_HDG_ALPHA * neff_ratio * pf_diff;
+                }
+                {
+                    double hdg_rad = dr_hdg * M_PI / 180.0;
+                    double cos_l   = std::cos(dr_lat * M_PI / 180.0);
+                    dr_lat += dr_speed * dt_s * std::cos(hdg_rad) / 111320.0;
+                    dr_lon += dr_speed * dt_s * std::sin(hdg_rad) / (111320.0 * cos_l);
+                }
+
+                // Candidate position from Neff-weighted blend
+                double cand_lat = neff_ratio * est.lat + (1.0 - neff_ratio) * dr_lat;
+                double cand_lon = neff_ratio * est.lon + (1.0 - neff_ratio) * dr_lon;
+
+                // Step-consistency filter: reject candidate if heading or distance
+                // implied by prev→cand deviates too far from the DR heading.
+                bool step_ok = true;
+                if (!trajectory.empty() && trajectory.back().gps_denied) {
                     const auto& prev = trajectory.back();
-                    tp.lat = EMA_ALPHA * est.lat + (1.0 - EMA_ALPHA) * prev.lat;
-                    tp.lon = EMA_ALPHA * est.lon + (1.0 - EMA_ALPHA) * prev.lon;
+                    double cos_l  = std::cos(prev.lat * M_PI / 180.0);
+                    double dlat   = (cand_lat - prev.lat) * 111320.0;
+                    double dlon   = (cand_lon - prev.lon) * 111320.0 * cos_l;
+                    double step_m = std::sqrt(dlat * dlat + dlon * dlon);
+
+                    double step_hdg = std::atan2(dlon, dlat) * 180.0 / M_PI;
+                    if (step_hdg < 0) step_hdg += 360.0;
+                    double dhdg = step_hdg - dr_hdg;
+                    while (dhdg >  180.0) dhdg -= 360.0;
+                    while (dhdg < -180.0) dhdg += 360.0;
+
+                    double max_step_m      = dr_speed * dt_s * 2.5;
+                    constexpr double MAX_HDG_JUMP = 25.0;  // °/step
+
+                    if (step_m > max_step_m || std::abs(dhdg) > MAX_HDG_JUMP) {
+                        step_ok = false;
+                    }
+                }
+
+                tp.lat = step_ok ? cand_lat : dr_lat;
+                tp.lon = step_ok ? cand_lon : dr_lon;
+
+                if (neff_ratio > 0.4 && step_ok) {
+                    dr_speed = est.speed_mps;
                 }
             } else {
                 tp.lat = est.lat;
@@ -864,8 +919,16 @@ int main(int argc, char** argv) {
 
     if (cfg.use_lnav)
         return run_line_navigator(cfg, dem, fixes, dt_s);
-    else if (cfg.use_combined)
+    else if (cfg.use_combined) {
+        // В режиме чекпоинта (--source) сначала строим тепловую карту через TERCOM,
+        // затем Combined перезаписывает trajectory.png и CSV точными оценками PF.
+        if (!cfg.source_dir.empty()) {
+            std::cerr << "[MAIN] Генерация тепловой карты корреляций (TERCOM)...\n";
+            run_tercom(cfg, dem, fixes, dt_s);
+            std::cerr << "[MAIN] correlation_heatmap.png сохранён. Запуск Combined...\n";
+        }
         return run_combined(cfg, dem, fixes, dt_s);
+    }
     else if (cfg.use_cpf)
         return run_contour_pf(cfg, dem, fixes, dt_s);
     else if (cfg.use_pf)

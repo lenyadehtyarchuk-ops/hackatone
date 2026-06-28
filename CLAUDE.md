@@ -36,6 +36,68 @@
 
 **Время работы:** ~1.7 с на весь полёт (vs 3–4 мин у TERCOM на 1095 измерений)
 
+### Адаптивный режим: FLAT vs MOUNTAIN
+При входе в зону глушения алгоритм сэмплирует ЦМР в радиусе 3 км и вычисляет `local_sigma` (СКО высот):
+- `local_sigma < 50 м` → **FLAT mode** (степь): DR-якорь с мягкой PF-коррекцией
+- `local_sigma ≥ 50 м` → **MOUNTAIN mode**: стандартный ContourPF
+
+**Почему PF плохо работает на степи:** изолиния `baro−AGL = const` на плоском рельефе покрывает полосу шириной несколько км. Частицы имеют одинаковый вес везде на этой полосе → среднее по облаку = случайная точка. Neff остаётся высоким, но это ложная уверенность.
+
+**FLAT mode — DR/PF blend со step-filter:**
+1. Dead Reckoning строится от последней GPS-точки по курсу и `yaw_rate` из GPS-истории
+2. DR-курс обновляется: `hdg = hdg_gps_base + yaw_rate·dt + 0.3·neff_ratio·(pf_hdg − hdg_base)` — PF влияет слабо (30%)
+3. Позиция: `pos = neff_ratio·est_pf + (1−neff_ratio)·dr` — Neff-взвешенный blend
+4. **Step-filter**: если предложенный шаг > 2.5× ожидаемого ИЛИ отклонение курса > 25° → отбросить PF, взять DR
+5. Скорость обновляется из PF когда `neff_ratio > 0.4` и шаг прошёл фильтр
+
+**Итог:** на степи траектория следует GPS-курсу; PF вносит мягкую коррекцию не захватывая управление.
+
+---
+
+## Формат входных данных (чекпоинт жюри)
+
+```
+./build/trn --source <dir> --combined ...
+```
+Директория `<dir>` должна содержать:
+- `manifest.ini` — параметры полёта
+- `heights.txt` — AGL-высоты в метрах, по одной на строку
+- `map.tif` — ЦМР в формате GeoTIFF
+
+**manifest.ini:**
+```ini
+[flight]
+origin_lat = 43.503370
+origin_lon = 42.492140
+heading_deg = 120
+speed_mps = 40
+; baro_alt_m = 6500   ; опционально — если не задан, авто: DEM(start) + AGL[0]
+```
+
+**Автооценка baro:** если `baro_alt_m` не задан в manifest, вычисляется как `DEM(start_lat, start_lon) + AGL[0]`. Работает при условии что дрон в момент старта находится в начальной точке.
+
+---
+
+## Формат вывода CSV
+
+Оба режима (TERCOM и Combined) пишут `trn_estimate.csv`:
+
+```
+timestamp_s,found_lat,found_lon,x_m,y_m,heading_deg,speed_mps,neff
+```
+- `x_m, y_m` — локальные координаты в метрах от стартовой точки (восток/север)
+- `x_m = (lon − start_lon) · 111320 · cos(start_lat)`
+- `y_m = (lat − start_lat) · 111320`
+
+**Итоговый вывод `=== ИТОГ ===`:**
+```
+Старт:    lat=... lon=...  (x=0 м, y=0 м)
+Финиш:    lat=... lon=...  (x=XXXX м, y=XXXX м)
+Пройдено:  XXXX м
+Скорость:  XX.X м/с (оценка PF)
+Азимут:    XXX.X°
+```
+
 ---
 
 ## Стек
@@ -54,21 +116,9 @@ mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(np
 
 ---
 
-## Демонстрационные запуски (Эльбрус, реальный Copernicus GLO-30)
+## Демонстрационные запуски
 
-### TERCOM demo — прямолинейный полёт, чистая демонстрация алгоритма
-```bash
-./build/trn \
-  --dem data/dem/elbrus.tif \
-  --nmea data/nmea/tercom_straight.nmea \
-  --baro 6500 --lat 43.503370 --lon 42.492140 \
-  --speed 40 --min-profile 35 --radius 3000 \
-  --jammer-zone 43.4639,42.5139,43.4925,42.5690 \
-  --out results/tercom_demo
-# Результат: az=120° (истинный 120°), NCC=0.924
-```
-
-### Combined — реалистичный маршрут (переменная скорость, изгибы курса)
+### Combined — реалистичный маршрут (горы, переменная скорость, изгибы курса)
 ```bash
 ./build/trn \
   --dem data/dem/elbrus.tif \
@@ -79,7 +129,7 @@ mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(np
   --combined --lnav-thresh 0.08 --pf-hdg-noise 1.5 --cpf-sigma 20
 ```
 
-### Combined — синусоидальный маршрут
+### Combined — синусоидальный маршрут (горы)
 ```bash
 ./build/trn \
   --dem data/dem/elbrus.tif \
@@ -90,16 +140,41 @@ mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(np
   --combined --lnav-thresh 0.08 --pf-hdg-noise 1.5 --cpf-sigma 20
 ```
 
+### Combined — mostly jammed (94.7% зона глушения, горы)
+```bash
+./build/trn \
+  --dem data/dem/elbrus.tif \
+  --nmea data/nmea/elbrus_mostly_jammed.nmea \
+  --baro 6500 --lat 43.503370 --lon 42.492140 --azimuth 120 \
+  --speed 40 --out results/mostly_jammed \
+  --jammer-zone 43.4639,42.5139,43.4925,42.5690 \
+  --combined --lnav-thresh 0.08 --pf-hdg-noise 1.5 --cpf-sigma 20
+```
+
+### Combined — Оренбург (степь, FLAT mode)
+```bash
+./build/trn \
+  --dem data/dem/orenburg.tif \
+  --nmea data/nmea/orenburg_demo.nmea \
+  --baro 300 --lat 51.537 --lon 55.033 --speed 40 \
+  --out results/orenburg_demo \
+  --jammer-zone 51.510,55.056,51.565,55.093 \
+  --combined --lnav-thresh 0.08 --pf-hdg-noise 1.5 --cpf-sigma 20
+# FLAT mode (local_sigma=22 м) → DR/PF blend, az=90°
+```
+
+### Спутниковые изображения
+```bash
+python3 scripts/fetch_satellite.py \
+  --dem data/dem/elbrus.tif \
+  --gt data/nmea/elbrus_realistic_gt.csv \
+  --trn results/combined_realistic/trn_estimate.csv \
+  --jammer-zone 43.4639,42.5139,43.4925,42.5690 \
+  --out results/combined_realistic/trajectory_satellite.png --zoom 13
+```
+
 ### Генерация NMEA
 ```bash
-# Прямолинейный (для TERCOM demo)
-python3 scripts/generate_nmea.py \
-  --dem data/dem/elbrus.tif \
-  --lat 43.503370 --lon 42.492140 --azimuth 120 --speed 40 \
-  --duration 180 --baro 6500 --noise 2 \
-  --jammer-zone 43.4639,42.5139,43.4925,42.5690 \
-  --out data/nmea/tercom_straight.nmea
-
 # Реалистичный (переменная скорость, изгибы, dt=0.2 с)
 python3 scripts/generate_nmea.py \
   --dem data/dem/elbrus.tif \
@@ -114,14 +189,14 @@ python3 scripts/generate_nmea.py \
 
 ## Результаты верификации
 
-| Сценарий | Алгоритм | Азимут истинный | Найден | NCC | Время |
+| Сценарий | Алгоритм | Режим | Азимут истинный | Найден | Время |
 |---|---|---|---|---|---|
-| Прямолинейный, σ=2 м | TERCOM | 120° | 120° | 0.924 | 2 с |
-| Реалистичный (изгибы), σ=2 м | Combined | ~120° | 151° | — | 1.7 с |
-| Синусоидальный, σ=2 м | Combined | ~120° | 147° | — | 1.7 с |
-| Реалистичный, σ=2 м | TERCOM | 120° | 125° | 0.801 | 4 мин |
+| Реалистичный (изгибы) | Combined | MOUNTAIN | ~120° | 127° | 1.7 с |
+| Синусоидальный | Combined | MOUNTAIN | ~120° | 120° | 1.7 с |
+| Mostly jammed (94.7%) | Combined | MOUNTAIN | 120° | 120° | 1.7 с |
+| Оренбург (степь) | Combined | FLAT | 90° | 90°, Δy=−0.3 м | 1.7 с |
 
-Вывод: Combined в 100× быстрее TERCOM и точнее на нелинейных траекториях.
+Вывод: Combined в 100× быстрее TERCOM; FLAT mode корректно обрабатывает степной рельеф через DR-якорь.
 
 ---
 
@@ -131,6 +206,7 @@ src/
   main.cpp                    — CLI: --dem --nmea --baro --lat --lon --speed
                                       --min-profile --radius --az-step --sliding
                                       --combined --lnav-thresh --pf-hdg-noise --cpf-sigma
+                                      --source (формат чекпоинта жюри)
   nmea_parser.hpp/.cpp        — разбор GPGGA (поле 9=AGL, поле 11=MSL, поле 6=quality)
   dem_loader.hpp/.cpp         — GDAL → cv::Mat float32 + GeoTransform
   terrain_correlator.hpp/.cpp — двухканальный NCC по 360 азимутам, sliding window
@@ -140,18 +216,20 @@ src/
   keypoint_db.hpp/.cpp        — БД пиков рельефа (fallback для CPF без RidgeMap)
   line_navigator.hpp/.cpp     — dead reckoning + дискретные фиксы от хребтов (LNAV-режим)
   particle_filter.hpp/.cpp    — базовый PF (предшественник ContourPF)
-  visualizer.hpp/.cpp         — тепловая карта NCC (X=азимут, Y=расстояние) +
-                                  цветная карта высот hillshade + стрелка TERCOM
+  checkpoint_loader.hpp/.cpp  — чтение manifest.ini + heights.txt → NmeaFix[]
+  visualizer.hpp/.cpp         — тепловая карта NCC + цветная карта высот hillshade +
+                                  стрелка TERCOM + az/v подпись на всех изображениях
 
 scripts/
   generate_nmea.py            — синтетический NMEA из реального ЦМР
                                   (Орнштейн-Уленбек для скорости, heading-sigma для курса,
                                    --jammer-zone → quality=0 внутри зоны)
-  fetch_satellite.py          — скачивает ESRI World Imagery тайлы, накладывает GT+TRN треки
+  fetch_satellite.py          — скачивает ESRI World Imagery тайлы, накладывает GT+TRN треки,
+                                  az/v подпись рядом со стартом
 
 data/dem/
   elbrus.tif                  — Copernicus GLO-30, Эльбрус N43E042 (основной)
-  orenburg.tif                — вырезка Оренбург, степь (для демо на плоском рельефе)
+  orenburg.tif                — вырезка Оренбург, степь (FLAT mode demo)
   steppe.tif                  — синтетический ЦМР степи
 
 data/nmea/
@@ -159,15 +237,17 @@ data/nmea/
   elbrus_realistic_gt.csv     — ground truth [t, lat, lon, heading, speed, terrain_h, gps_ok]
   elbrus_sine.nmea            — синусоидальный маршрут, dt=0.2 с, 1095 измерений
   elbrus_sine_gt.csv          — ground truth
-  tercom_straight.nmea        — прямолинейный, dt=1 с, 180 измерений (для TERCOM demo)
-  tercom_straight_gt.csv      — ground truth
-  orenburg_flight.nmea        — полёт над степью (для демо на Оренбурге)
+  elbrus_mostly_jammed.nmea   — 94.7% GPS-denied, dt=0.2 с
+  elbrus_mostly_jammed_gt.csv — ground truth
+  orenburg_demo.nmea          — полёт над степью, az=90°, FLAT mode demo
+  orenburg_demo_gt.csv        — ground truth
 
 results/
-  tercom_demo/                — TERCOM: correlation_heatmap.png, trajectory.png, trn_estimate.csv
-  combined_realistic/         — Combined: trajectory.png, trajectory_satellite.png,
-                                           correlation_heatmap.png, trn_estimate.csv
-  combined_sine/              — Combined: то же для синусоидального маршрута
+  combined_realistic/         — Combined MOUNTAIN: trajectory.png, trajectory_satellite.png,
+                                                    trn_estimate.csv
+  combined_sine/              — Combined MOUNTAIN: то же для синусоидального маршрута
+  mostly_jammed/              — Combined MOUNTAIN: 94.7% GPS-denied demo
+  orenburg_demo/              — Combined FLAT: степной рельеф, DR/PF blend demo
 ```
 
 ## Скачать ЦМР (Copernicus GLO-30, бесплатно)
