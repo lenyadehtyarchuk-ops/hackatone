@@ -735,8 +735,26 @@ static int run_combined(const Config& cfg, const DemData& dem,
             }
             auto est = cpf->step(fix.radio_alt_m, cfg.baro_alt_m, dt_s,
                                  active_hdg_noise, 1.0, active_cpf_sigma);
-            tp.lat         = est.lat;
-            tp.lon         = est.lon;
+
+            // In flat terrain mode apply EMA using the accumulated estimated track:
+            // each output position is a blend of the current PF estimate and the
+            // previous smoothed position, so the already-guessed trajectory
+            // stabilises future outputs rather than letting PF noise accumulate.
+            if (active_cpf_sigma > cfg.cpf_sigma) {  // flat mode flag
+                constexpr double EMA_ALPHA = 0.45;
+                if (trajectory.empty() || !trajectory.back().gps_denied) {
+                    // First denied step — seed smoother at last GPS fix
+                    tp.lat = est.lat;
+                    tp.lon = est.lon;
+                } else {
+                    const auto& prev = trajectory.back();
+                    tp.lat = EMA_ALPHA * est.lat + (1.0 - EMA_ALPHA) * prev.lat;
+                    tp.lon = EMA_ALPHA * est.lon + (1.0 - EMA_ALPHA) * prev.lon;
+                }
+            } else {
+                tp.lat = est.lat;
+                tp.lon = est.lon;
+            }
             tp.heading_deg = est.heading_deg;
             tp.speed_mps   = est.speed_mps;
             tp.ncc         = est.neff / cfg.cpf_n;
